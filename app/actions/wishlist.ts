@@ -1,9 +1,19 @@
 'use server';
 
-import { supabase } from '@/lib/supabase';
+import { supabase, isSupabaseConfigured } from '@/lib/supabase';
 import { revalidatePath } from 'next/cache';
+import { cookies } from 'next/headers';
+
+function assertSupabase() {
+  if (!isSupabaseConfigured) {
+    throw new Error(
+      'Supabase n’est pas configuré. Veuillez renseigner NEXT_PUBLIC_SUPABASE_URL et NEXT_PUBLIC_SUPABASE_ANON_KEY dans votre fichier .env.local.'
+    );
+  }
+}
 
 export async function createList(title: string) {
+  assertSupabase();
   const { data, error } = await supabase
     .from('lists')
     .insert([{ title }])
@@ -11,10 +21,26 @@ export async function createList(title: string) {
     .single();
 
   if (error) throw new Error(error.message);
+
+  if (data?.id && data?.admin_token) {
+    try {
+      const cookieStore = await cookies();
+      cookieStore.set(`wishlist_admin_${data.id}`, data.admin_token, {
+        path: '/',
+        maxAge: 60 * 60 * 24 * 365,
+        sameSite: 'lax',
+      });
+    } catch {
+      // ignore in environments where cookies cannot be set
+    }
+  }
+
   return data;
 }
 
 export async function getListWithItems(listId: string, adminToken?: string) {
+  if (!isSupabaseConfigured) return null;
+
   const { data: list, error: listError } = await supabase
     .from('lists')
     .select('*')
@@ -23,7 +49,28 @@ export async function getListWithItems(listId: string, adminToken?: string) {
 
   if (listError || !list) return null;
 
-  const isAdmin = adminToken === list.admin_token;
+  let isAdmin = false;
+
+  try {
+    const cookieStore = await cookies();
+    const storedToken = cookieStore.get(`wishlist_admin_${listId}`)?.value;
+
+    const effectiveToken = adminToken || storedToken;
+    if (effectiveToken && effectiveToken === list.admin_token) {
+      isAdmin = true;
+      try {
+        cookieStore.set(`wishlist_admin_${listId}`, effectiveToken, {
+          path: '/',
+          maxAge: 60 * 60 * 24 * 365,
+          sameSite: 'lax',
+        });
+      } catch {
+        // ignore cookie write error during read actions
+      }
+    }
+  } catch {
+    isAdmin = adminToken === list.admin_token;
+  }
 
   const { data: items, error: itemsError } = await supabase
     .from('items')
@@ -57,6 +104,7 @@ export async function addItemToList(data: {
   preferenceOrder: number;
   options?: string;
 }) {
+  assertSupabase();
   const { error } = await supabase.from('items').insert([
     {
       list_id: data.listId,
@@ -74,9 +122,21 @@ export async function addItemToList(data: {
 }
 
 export async function reserveItem(itemId: string, listId: string, reservedBy: string) {
+  assertSupabase();
   const { error } = await supabase
     .from('items')
     .update({ is_reserved: true, reserved_by: reservedBy })
+    .eq('id', itemId);
+
+  if (error) throw new Error(error.message);
+  revalidatePath(`/liste/${listId}`);
+}
+
+export async function cancelReservation(itemId: string, listId: string) {
+  assertSupabase();
+  const { error } = await supabase
+    .from('items')
+    .update({ is_reserved: false, reserved_by: null })
     .eq('id', itemId);
 
   if (error) throw new Error(error.message);
@@ -95,6 +155,7 @@ export async function updateItem(
     options?: string;
   }
 ) {
+  assertSupabase();
   const updatePayload: Record<string, any> = {
     title: data.title,
     price: data.price,
@@ -119,6 +180,7 @@ export async function updateItem(
 }
 
 export async function deleteItem(itemId: string, listId: string) {
+  assertSupabase();
   const { error } = await supabase.from('items').delete().eq('id', itemId);
   if (error) throw new Error(error.message);
   revalidatePath(`/liste/${listId}`);

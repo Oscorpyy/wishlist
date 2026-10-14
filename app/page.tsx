@@ -7,6 +7,7 @@ import { createList } from '@/app/actions/wishlist';
 export default function HomePage() {
   const [title, setTitle] = useState('');
   const [loading, setLoading] = useState(false);
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const router = useRouter();
 
   const handleCreate = async (e: React.FormEvent) => {
@@ -14,17 +15,28 @@ export default function HomePage() {
     if (!title.trim()) return;
 
     setLoading(true);
+    setErrorMsg(null);
     try {
       const newList = await createList(title);
+      if (typeof document !== 'undefined' && newList?.id && newList?.admin_token) {
+        document.cookie = `wishlist_admin_${newList.id}=${newList.admin_token}; path=/; max-age=31536000; SameSite=Lax`;
+        try {
+          localStorage.setItem(`wishlist_admin_${newList.id}`, newList.admin_token);
+        } catch {}
+      }
       // Redirect directly with the admin_token key
       router.push(`/liste/${newList.id}?key=${newList.admin_token}`);
-    } catch (err) {
+    } catch (err: any) {
       console.error(err);
-      alert('Failed to create wishlist');
+      const msg = err?.message || 'Failed to create wishlist';
+      setErrorMsg(msg);
+      alert(msg);
     } finally {
       setLoading(false);
     }
   };
+
+  const isConfigured = Boolean(process.env.NEXT_PUBLIC_SUPABASE_URL);
 
   return (
     <main className="min-h-screen flex items-center justify-center bg-gray-50 p-4">
@@ -32,6 +44,21 @@ export default function HomePage() {
         <h1 className="text-2xl font-bold text-gray-800 mb-4 text-center">
           Create Your Wishlist
         </h1>
+
+        {!isConfigured && (
+          <div className="mb-4 p-3 bg-amber-50 border border-amber-200 text-amber-800 text-xs rounded-lg space-y-1">
+            <p className="font-semibold">⚠️ Configuration Supabase manquante</p>
+            <p>
+              Créez ou complétez le fichier <code>.env.local</code> avec vos clés <code>NEXT_PUBLIC_SUPABASE_URL</code> et <code>NEXT_PUBLIC_SUPABASE_ANON_KEY</code>.
+            </p>
+          </div>
+        )}
+
+        {errorMsg && (
+          <div className="mb-4 p-3 bg-red-50 border border-red-200 text-red-700 text-xs rounded-lg">
+            {errorMsg}
+          </div>
+        )}
         <form onSubmit={handleCreate} className="space-y-4">
           <div>
             <label className="block text-sm font-medium text-gray-700 mb-1">

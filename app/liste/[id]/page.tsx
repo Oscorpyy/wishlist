@@ -2,7 +2,7 @@
 
 import { useEffect, useState, useRef, Suspense } from 'react';
 import { useParams, useSearchParams } from 'next/navigation';
-import { getListWithItems, addItemToList, reserveItem, updateItem, deleteItem } from '@/app/actions/wishlist';
+import { getListWithItems, addItemToList, reserveItem, cancelReservation, updateItem, deleteItem } from '@/app/actions/wishlist';
 import { scrapeProductUrl } from '@/app/actions/scrape';
 
 interface Item {
@@ -49,9 +49,12 @@ function WishlistContent() {
 
   const [data, setData] = useState<ListData | null>(null);
   const [loading, setLoading] = useState(true);
+  const [copied, setCopied] = useState(false);
+  const [showShareModal, setShowShareModal] = useState(false);
 
   // Form states for adding a new item
   const [url, setUrl] = useState('');
+  const [lastScrapedUrl, setLastScrapedUrl] = useState('');
   const [scraping, setScraping] = useState(false);
   const [scrapedTitle, setScrapedTitle] = useState('');
   const [scrapedImage, setScrapedImage] = useState('');
@@ -70,6 +73,7 @@ function WishlistContent() {
   const [editTitle, setEditTitle] = useState('');
   const [editPrice, setEditPrice] = useState('');
   const [editImageUrl, setEditImageUrl] = useState('');
+  const [editImages, setEditImages] = useState<string[]>([]);
   const [editProductUrl, setEditProductUrl] = useState('');
   const [editPreference, setEditPreference] = useState(1);
   const [editOptions, setEditOptions] = useState('');
@@ -82,7 +86,30 @@ function WishlistContent() {
   const loadList = async () => {
     if (!listId) return;
     setLoading(true);
-    const res = await getListWithItems(listId, adminKey);
+
+    // Check URL query param first, then client-side cookie and localStorage
+    let effectiveKey = adminKey;
+    if (!effectiveKey && typeof document !== 'undefined') {
+      const match = document.cookie.match(new RegExp(`(?:^|; )wishlist_admin_${listId}=([^;]*)`));
+      if (match && match[1]) {
+        effectiveKey = decodeURIComponent(match[1]);
+      }
+      if (!effectiveKey) {
+        try {
+          effectiveKey = localStorage.getItem(`wishlist_admin_${listId}`) || undefined;
+        } catch {}
+      }
+    }
+
+    // Persist effectiveKey into cookie and localStorage
+    if (effectiveKey && typeof document !== 'undefined') {
+      document.cookie = `wishlist_admin_${listId}=${effectiveKey}; path=/; max-age=31536000; SameSite=Lax`;
+      try {
+        localStorage.setItem(`wishlist_admin_${listId}`, effectiveKey);
+      } catch {}
+    }
+
+    const res = await getListWithItems(listId, effectiveKey);
     const listData = res as ListData | null;
     setData(listData);
     if (listData && listData.items) {
@@ -96,12 +123,22 @@ function WishlistContent() {
     loadList();
   }, [listId, adminKey]);
 
+  const handleShare = () => {
+    const guestUrl = `${window.location.origin}/liste/${listId}`;
+    navigator.clipboard.writeText(guestUrl);
+    setCopied(true);
+    setTimeout(() => {
+      setCopied(false);
+    }, 2000);
+  };
+
   // Modal keyboard navigation
   useEffect(() => {
-    if (!selectedItem && !editingItem) return;
+    if (!selectedItem && !editingItem && !showShareModal) return;
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
-        if (editingItem) setEditingItem(null);
+        if (showShareModal) setShowShareModal(false);
+        else if (editingItem) setEditingItem(null);
         else if (selectedItem) setSelectedItem(null);
       } else if (e.key === 'ArrowLeft' && selectedItem && !editingItem) {
         const images = parseItemImages(selectedItem.image_url);
@@ -124,8 +161,17 @@ function WishlistContent() {
     setEditingItem(item);
     setEditTitle(item.title);
     setEditPrice(item.price !== null ? item.price.toString() : '');
-    setEditImageUrl(item.image_url || '');
-    setEditProductUrl(item.product_url || '');
+
+    // Parse image array so we display a clean single URL in the input field, not a JSON string!
+    const imgs = parseItemImages(item.image_url);
+    setEditImages(imgs);
+    setEditImageUrl(imgs[0] || '');
+
+    let prodUrl = item.product_url || '';
+    if (prodUrl && !prodUrl.startsWith('http://') && !prodUrl.startsWith('https://')) {
+      prodUrl = `https://${prodUrl}`;
+    }
+    setEditProductUrl(prodUrl);
     setEditPreference(item.preference_order || 1);
     setEditOptions(item.options || '');
   };
@@ -135,11 +181,44 @@ function WishlistContent() {
     if (!editingItem || !listId || !editTitle.trim()) return;
     setSavingEdit(true);
     try {
+      let finalProductUrl = editProductUrl.trim();
+      if (finalProductUrl && !finalProductUrl.startsWith('http://') && !finalProductUrl.startsWith('https://')) {
+        finalProductUrl = `https://${finalProductUrl}`;
+      }
+
+      let finalImageUrl = editImageUrl.trim();
+      if (
+        finalImageUrl &&
+        !finalImageUrl.startsWith('http://') &&
+        !finalImageUrl.startsWith('https://') &&
+        !finalImageUrl.startsWith('data:') &&
+        !finalImageUrl.startsWith('/')
+      ) {
+        finalImageUrl = `https://${finalImageUrl}`;
+      }
+
+      // Preserve multiple images gallery if applicable
+      let imagePayload = finalImageUrl;
+      if (editImages.length > 1) {
+        if (editImages.includes(finalImageUrl)) {
+          // Reorder with selected cover image first
+          const reordered = [finalImageUrl, ...editImages.filter((u) => u !== finalImageUrl)];
+          imagePayload = JSON.stringify(reordered);
+        } else if (finalImageUrl) {
+          // New image added as first item in gallery
+          imagePayload = JSON.stringify([finalImageUrl, ...editImages.slice(1)]);
+        } else {
+          imagePayload = JSON.stringify(editImages);
+        }
+      } else if (finalImageUrl) {
+        imagePayload = JSON.stringify([finalImageUrl]);
+      }
+
       await updateItem(editingItem.id, listId, {
         title: editTitle.trim(),
         price: editPrice ? parseFloat(editPrice) : null,
-        image_url: editImageUrl.trim(),
-        product_url: editProductUrl.trim(),
+        image_url: imagePayload,
+        product_url: finalProductUrl,
         preference_order: editPreference,
         options: editOptions.trim(),
       });
@@ -149,15 +228,15 @@ function WishlistContent() {
           ...selectedItem,
           title: editTitle.trim(),
           price: editPrice ? parseFloat(editPrice) : null,
-          image_url: editImageUrl.trim(),
-          product_url: editProductUrl.trim(),
+          image_url: imagePayload,
+          product_url: finalProductUrl,
           preference_order: editPreference,
           options: editOptions.trim(),
         });
       }
 
       setEditingItem(null);
-      loadList();
+      await loadList();
     } catch (err: any) {
       alert(err.message || 'Erreur lors de la mise à jour');
     } finally {
@@ -182,20 +261,28 @@ function WishlistContent() {
     setScraping(true);
     try {
       const res = await scrapeProductUrl(url);
-      setScrapedTitle(res.title || '');
+      setScrapedTitle(res.title || 'Product');
       setScrapedImage(res.image || '');
       setScrapedImages(res.images && res.images.length > 0 ? res.images : (res.image ? [res.image] : []));
-      setScrapedPrice(res.price ? res.price.toString() : '');
+      setScrapedPrice(res.price !== null ? res.price.toString() : '');
       setOptions(res.options || '');
       setScrapedAvailableOptions(res.availableOptions || {});
       const maxPref = data?.items?.reduce((max, item) => Math.max(max, item.preference_order || 0), 0) ?? 0;
       setPreference(maxPref + 1);
-      if (!res.title) {
-        setScrapedTitle('Product');
-      }
+      setLastScrapedUrl(url);
+
+      // Focus the first text zone (Title) so Shift+Enter cycles through fields and Ctrl+Enter saves
+      setTimeout(() => {
+        fieldRefs[0].current?.focus();
+        fieldRefs[0].current?.select();
+      }, 50);
     } catch {
-      alert('Unable to parse URL metadata. You can fill in the fields manually.');
-      setScrapedTitle('Product');
+      alert('Impossible d’extraire automatiquement les informations du produit. Vous pouvez remplir les champs manuellement.');
+      setScrapedTitle('Produit');
+      setLastScrapedUrl(url);
+      setTimeout(() => {
+        fieldRefs[0].current?.focus();
+      }, 50);
     } finally {
       setScraping(false);
     }
@@ -226,6 +313,7 @@ function WishlistContent() {
     setPreference(Math.max(maxPref, preference) + 1);
 
     setUrl('');
+    setLastScrapedUrl('');
     setScrapedTitle('');
     setScrapedImage('');
     setScrapedImages([]);
@@ -233,6 +321,10 @@ function WishlistContent() {
     setOptions('');
     setScrapedAvailableOptions({});
     loadList();
+
+    setTimeout(() => {
+      urlInputRef.current?.focus();
+    }, 50);
   };
 
   const handleReserve = async (itemId: string) => {
@@ -250,7 +342,28 @@ function WishlistContent() {
     loadList();
   };
 
-  // Refs for add-item form keyboard navigation (Shift+Enter = next field, Ctrl+Enter = submit)
+  const handleCancelReservation = async (itemId: string, e?: React.MouseEvent) => {
+    if (e) e.stopPropagation();
+    if (!listId) return;
+    if (!confirm('Voulez-vous annuler la réservation de cet article ?')) return;
+
+    try {
+      await cancelReservation(itemId, listId);
+      if (selectedItem && selectedItem.id === itemId) {
+        setSelectedItem({
+          ...selectedItem,
+          is_reserved: false,
+          reserved_by: undefined,
+        });
+      }
+      await loadList();
+    } catch (err: any) {
+      alert(err?.message || 'Erreur lors de l’annulation de la réservation');
+    }
+  };
+
+  // Refs for add-item form keyboard navigation (Shift+Enter = cycle fields, Ctrl+Enter = validate)
+  const urlInputRef = useRef<HTMLInputElement>(null);
   const fieldRef0 = useRef<HTMLInputElement>(null);
   const fieldRef1 = useRef<HTMLInputElement>(null);
   const fieldRef2 = useRef<HTMLInputElement>(null);
@@ -260,15 +373,26 @@ function WishlistContent() {
   const fieldRefs = [fieldRef0, fieldRef1, fieldRef2, fieldRef3, fieldRef4];
 
   const handleFormKeyDown = (e: React.KeyboardEvent<HTMLInputElement>, index: number) => {
-    if (e.key === 'Enter' && e.ctrlKey) {
-      e.preventDefault();
-      submitRef.current?.click();
-    } else if (e.key === 'Enter' && e.shiftKey) {
-      e.preventDefault();
-      if (index < fieldRefs.length - 1) {
-        fieldRefs[index + 1].current?.focus();
+    if (e.key === 'Enter') {
+      if (e.shiftKey) {
+        // Shift + Enter: Strictly navigates between text zones
+        e.preventDefault();
+        if (index < fieldRefs.length - 1) {
+          fieldRefs[index + 1].current?.focus();
+          fieldRefs[index + 1].current?.select();
+        } else {
+          // Loop back to URL input or first field
+          urlInputRef.current?.focus();
+          urlInputRef.current?.select();
+        }
+      } else if (e.ctrlKey || e.metaKey) {
+        // Ctrl + Enter: Validate and save the item
+        e.preventDefault();
+        submitRef.current?.click();
       } else {
-        submitRef.current?.focus();
+        // Plain Enter: also validates and saves
+        e.preventDefault();
+        submitRef.current?.click();
       }
     }
   };
@@ -284,13 +408,29 @@ function WishlistContent() {
 
   return (
     <div className="max-w-4xl mx-auto space-y-6">
-      <header className="bg-white p-6 rounded-xl shadow flex justify-between items-center">
+      <header className="bg-white p-6 rounded-xl shadow flex justify-between items-center gap-4">
         <div>
           <h1 className="text-3xl font-bold text-gray-800">{data.list.title}</h1>
-          <p className="text-sm text-gray-500">
-            {data.isAdmin ? '👑 Creator View (Spoilers hidden)' : '👥 Guest View'}
+          <p className="text-sm text-gray-500 mt-0.5">
+            {data.isAdmin
+              ? '👑 Mode Créateur (Réservations masquées pour garder la surprise !)'
+              : '👥 Mode Invité (Vous pouvez réserver des articles)'}
           </p>
         </div>
+        <button
+          type="button"
+          onClick={() => {
+            handleShare();
+            setShowShareModal(true);
+          }}
+          className="flex items-center gap-2 bg-blue-600 hover:bg-blue-700 text-white px-3.5 py-2 rounded-xl font-medium shadow-sm transition-all cursor-pointer shrink-0"
+          title="Partager le lien de la wishlist"
+        >
+          <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8.684 13.342C8.886 12.938 9 12.482 9 12c0-.482-.114-.938-.316-1.342m0 2.684a3 3 0 110-2.684m0 2.684l6.632 3.316m-6.632-6l6.632-3.316m0 0a3 3 0 105.367-2.684 3 3 0 00-5.367 2.684zm0 9.316a3 3 0 105.368 2.684 3 3 0 00-5.368-2.684z" />
+          </svg>
+          <span className="text-sm font-semibold">{copied ? 'Lien copié !' : 'Partager'}</span>
+        </button>
       </header>
 
       {/* Creator Section: Add items */}
@@ -299,42 +439,55 @@ function WishlistContent() {
           <h2 className="text-xl font-semibold text-gray-800">Add an Item</h2>
           <div className="flex gap-2">
             <input
+              ref={urlInputRef}
               type="url"
               placeholder="Paste product link (Amazon, Maxesport...)"
               value={url}
+              disabled={scraping}
               onChange={(e) => setUrl(e.target.value)}
               onKeyDown={async (e) => {
-                if (e.key === 'Enter' && e.shiftKey) {
-                  e.preventDefault();
-                  if (!scraping) {
-                    await handleScrape();
-                    fieldRef0.current?.focus();
+                if (e.key === 'Enter') {
+                  if (e.shiftKey) {
+                    e.preventDefault();
+                    if (scrapedTitle) {
+                      fieldRefs[0].current?.focus();
+                      fieldRefs[0].current?.select();
+                    }
+                  } else if (e.ctrlKey || e.metaKey) {
+                    e.preventDefault();
+                    if (scrapedTitle) {
+                      submitRef.current?.click();
+                    } else {
+                      await handleScrape();
+                    }
+                  } else {
+                    e.preventDefault();
+                    if (scraping) return;
+                    if (scrapedTitle && url === lastScrapedUrl) {
+                      submitRef.current?.click();
+                    } else {
+                      await handleScrape();
+                    }
                   }
-                } else if (e.key === 'Enter' && e.ctrlKey) {
-                  e.preventDefault();
-                  submitRef.current?.click();
-                } else if (e.key === 'Enter') {
-                  e.preventDefault();
-                  if (!scraping) handleScrape();
                 }
               }}
-              className="flex-1 border rounded-lg px-3 py-2 text-black"
+              className="flex-1 border rounded-lg px-3 py-2 text-black disabled:opacity-60"
             />
             <button
               type="button"
-              onClick={handleScrape}
-              disabled={scraping}
-              className="bg-gray-800 text-white px-4 py-2 rounded-lg hover:bg-gray-900 disabled:opacity-50"
+              onClick={scrapedTitle ? () => submitRef.current?.click() : handleScrape}
+              disabled={scraping || !url.trim()}
+              className="bg-gray-800 text-white px-5 py-2 rounded-lg hover:bg-gray-900 disabled:opacity-50 transition font-medium cursor-pointer shrink-0"
             >
-              {scraping ? 'Parsing...' : 'Fetch Info'}
+              {scraping ? 'Parsing...' : scrapedTitle ? 'Save Item' : 'Fetch Info'}
             </button>
           </div>
 
           {scrapedTitle && (
             <form onSubmit={handleAddItem} className="space-y-3 pt-4 border-t">
               {/* Keyboard hint */}
-              <p className="text-xs text-gray-400 italic">
-                💡 <kbd className="bg-gray-100 border border-gray-300 rounded px-1 text-[11px]">Shift</kbd>+<kbd className="bg-gray-100 border border-gray-300 rounded px-1 text-[11px]">↵</kbd> champ suivant &nbsp;·&nbsp; <kbd className="bg-gray-100 border border-gray-300 rounded px-1 text-[11px]">Ctrl</kbd>+<kbd className="bg-gray-100 border border-gray-300 rounded px-1 text-[11px]">↵</kbd> enregistrer
+              <p className="text-xs text-gray-500 italic">
+                💡 <kbd className="bg-gray-100 border border-gray-300 rounded px-1.5 py-0.5 text-[11px] font-mono font-semibold text-gray-700">Shift</kbd> + <kbd className="bg-gray-100 border border-gray-300 rounded px-1.5 py-0.5 text-[11px] font-mono font-semibold text-gray-700">↵</kbd> naviguer entre les champs &nbsp;·&nbsp; <kbd className="bg-gray-100 border border-gray-300 rounded px-1.5 py-0.5 text-[11px] font-mono font-semibold text-gray-700">Ctrl</kbd> + <kbd className="bg-gray-100 border border-gray-300 rounded px-1.5 py-0.5 text-[11px] font-mono font-semibold text-gray-700">↵</kbd> valider l&apos;article
               </p>
 
               <div>
@@ -438,16 +591,28 @@ function WishlistContent() {
                         <div className="flex flex-wrap gap-1.5">
                           {values.map((val) => {
                             const optStr = `${dimension}: ${val}`;
-                            const isSelected = options.includes(val);
+                            const escapedVal = val.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+                            const escapedDim = dimension.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+                            const isSelected =
+                              options.includes(optStr) ||
+                              new RegExp(`${escapedDim}:\\s*${escapedVal}(?:[,;]|$)`, 'i').test(options) ||
+                              new RegExp(`(^|[,;\\s])${escapedVal}([,;\\s]|$)`, 'i').test(options);
+
                             return (
                               <button
                                 key={val}
                                 type="button"
                                 onClick={() => {
                                   let newOptions = options;
-                                  if (newOptions.includes(`${dimension}:`)) {
+                                  if (isSelected) {
+                                    const pattern = new RegExp(`(?:${escapedDim}:\\s*)?${escapedVal}(?:[,;\\s]*)`, 'i');
+                                    newOptions = newOptions
+                                      .replace(pattern, '')
+                                      .replace(/,\s*,/g, ',')
+                                      .replace(/^[\s,]+|[\s,]+$/g, '');
+                                  } else if (newOptions.includes(`${dimension}:`)) {
                                     newOptions = newOptions.replace(
-                                      new RegExp(`${dimension}:\\s*[^,;]+`, 'i'),
+                                      new RegExp(`${escapedDim}:\\s*[^,;]+`, 'i'),
                                       optStr
                                     );
                                   } else if (newOptions.trim()) {
@@ -598,14 +763,22 @@ function WishlistContent() {
                 {!data.isAdmin ? (
                   <div>
                     {item.is_reserved ? (
-                      <div className="w-full text-center text-xs font-semibold bg-red-50 text-red-700 border border-red-200 py-2 px-3 rounded-lg">
-                        Reserved by {item.reserved_by}
+                      <div className="flex items-center justify-between gap-2 bg-red-50 text-red-700 border border-red-200 py-1.5 px-3 rounded-lg text-xs font-semibold">
+                        <span className="truncate">Réservé par {item.reserved_by}</span>
+                        <button
+                          type="button"
+                          onClick={(e) => handleCancelReservation(item.id, e)}
+                          className="text-xs bg-white hover:bg-red-100 text-red-700 border border-red-200 px-2 py-0.5 rounded shadow-sm transition-colors cursor-pointer shrink-0 font-medium"
+                          title="Annuler cette réservation"
+                        >
+                          Annuler
+                        </button>
                       </div>
                     ) : reservingItemId === item.id ? (
                       <div className="flex gap-1.5">
                         <input
                           type="text"
-                          placeholder="Your Name"
+                          placeholder="Votre nom"
                           value={reserverName}
                           onChange={(e) => setReserverName(e.target.value)}
                           onKeyDown={(e) => e.key === 'Enter' && handleReserve(item.id)}
@@ -615,7 +788,7 @@ function WishlistContent() {
                         <button
                           type="button"
                           onClick={() => handleReserve(item.id)}
-                          className="bg-blue-600 hover:bg-blue-700 text-white text-xs font-semibold px-3 py-1.5 rounded-lg transition-colors shadow-sm"
+                          className="bg-blue-600 hover:bg-blue-700 text-white text-xs font-semibold px-3 py-1.5 rounded-lg transition-colors shadow-sm cursor-pointer"
                         >
                           OK
                         </button>
@@ -625,8 +798,8 @@ function WishlistContent() {
                             setReservingItemId(null);
                             setReserverName('');
                           }}
-                          className="bg-gray-200 hover:bg-gray-300 text-gray-700 text-xs px-2.5 py-1.5 rounded-lg transition-colors"
-                          title="Cancel"
+                          className="bg-gray-200 hover:bg-gray-300 text-gray-700 text-xs px-2.5 py-1.5 rounded-lg transition-colors cursor-pointer"
+                          title="Annuler"
                         >
                           ✕
                         </button>
@@ -635,9 +808,9 @@ function WishlistContent() {
                       <button
                         type="button"
                         onClick={() => setReservingItemId(item.id)}
-                        className="w-full bg-blue-600 hover:bg-blue-700 text-white text-xs font-semibold py-2 px-4 rounded-lg transition-colors shadow-sm"
+                        className="w-full bg-blue-600 hover:bg-blue-700 text-white text-xs font-semibold py-2 px-4 rounded-lg transition-colors shadow-sm cursor-pointer"
                       >
-                        Reserve
+                        Réserver
                       </button>
                     )}
                   </div>
@@ -648,7 +821,7 @@ function WishlistContent() {
                     rel="noopener noreferrer"
                     className="block text-center text-xs font-medium text-gray-500 hover:text-blue-600 py-1.5 rounded-lg border border-gray-200 hover:bg-white transition-colors"
                   >
-                    View on Store ↗
+                    Voir sur la boutique ↗
                   </a>
                 )}
               </div>
@@ -820,8 +993,17 @@ function WishlistContent() {
                 {!data.isAdmin && (
                   <div className="w-full sm:w-auto flex-1">
                     {selectedItem.is_reserved ? (
-                      <div className="w-full text-center text-sm font-semibold bg-red-100 text-red-700 border border-red-200 py-3 px-4 rounded-xl">
-                        Réservé par {selectedItem.reserved_by}
+                      <div className="flex items-center justify-between gap-3 bg-red-50 border border-red-200 py-2.5 px-4 rounded-xl">
+                        <span className="text-sm font-semibold text-red-700 truncate">
+                          Réservé par {selectedItem.reserved_by}
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() => handleCancelReservation(selectedItem.id)}
+                          className="bg-white hover:bg-red-100 text-red-700 border border-red-300 text-xs font-semibold px-3 py-1.5 rounded-lg transition-colors shadow-sm cursor-pointer shrink-0"
+                        >
+                          Annuler la réservation
+                        </button>
                       </div>
                     ) : reservingItemId === selectedItem.id ? (
                       <div className="flex gap-2">
@@ -949,30 +1131,58 @@ function WishlistContent() {
               <div>
                 <label className="block text-sm font-medium text-gray-700 mb-1">URL du produit</label>
                 <input
-                  type="url"
+                  type="text"
                   value={editProductUrl}
                   onChange={(e) => setEditProductUrl(e.target.value)}
+                  placeholder="https://..."
                   className="w-full border rounded-xl px-3 py-2 text-black text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
                 />
               </div>
 
               <div>
-                <label className="block text-sm font-medium text-gray-700 mb-1">URL de l&apos;image</label>
+                <label className="block text-sm font-medium text-gray-700 mb-1">Image du produit</label>
                 <div className="flex gap-2 items-center">
-                  {editImageUrl && (
+                  {editImageUrl ? (
                     <img
                       src={editImageUrl}
                       alt=""
                       className="w-12 h-12 object-contain rounded-lg border bg-white p-1 shrink-0"
                     />
+                  ) : (
+                    <div className="w-12 h-12 bg-gray-100 rounded-lg border border-dashed flex items-center justify-center text-gray-400 text-xs shrink-0">
+                      No img
+                    </div>
                   )}
                   <input
-                    type="url"
+                    type="text"
                     value={editImageUrl}
                     onChange={(e) => setEditImageUrl(e.target.value)}
+                    placeholder="https://..."
                     className="flex-1 border rounded-xl px-3 py-2 text-black text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
                   />
                 </div>
+
+                {/* If multiple images exist, let user click a thumbnail to choose as cover */}
+                {editImages.length > 1 && (
+                  <div className="mt-2.5 space-y-1">
+                    <p className="text-xs text-gray-500 font-medium">Photos détectées (cliquez pour choisir l&apos;image principale) :</p>
+                    <div className="flex gap-2 overflow-x-auto p-1.5 bg-gray-50 rounded-xl border border-gray-100">
+                      {editImages.map((img, idx) => (
+                        <button
+                          key={idx}
+                          type="button"
+                          onClick={() => setEditImageUrl(img)}
+                          className={`w-12 h-12 rounded-lg border-2 p-0.5 bg-white shrink-0 cursor-pointer transition-all ${
+                            editImageUrl === img ? 'border-blue-600 ring-2 ring-blue-100 shadow-sm' : 'border-gray-200 opacity-60 hover:opacity-100'
+                          }`}
+                          title="Définir comme image principale"
+                        >
+                          <img src={img} alt="" className="w-full h-full object-contain rounded" />
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                )}
               </div>
 
               {/* Footer buttons */}
@@ -996,6 +1206,70 @@ function WishlistContent() {
                 </button>
               </div>
             </form>
+          </div>
+        </div>
+      )}
+
+      {/* Share Modal Dialog */}
+      {showShareModal && (
+        <div
+          className="fixed inset-0 z-50 bg-black/60 backdrop-blur-sm flex items-center justify-center p-4"
+          onClick={() => setShowShareModal(false)}
+        >
+          <div
+            className="bg-white rounded-3xl max-w-md w-full p-6 shadow-2xl space-y-4 relative animate-in fade-in duration-150"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex justify-between items-center pb-2 border-b border-gray-100">
+              <div className="flex items-center gap-3">
+                <div className="w-10 h-10 rounded-xl bg-blue-50 text-blue-600 flex items-center justify-center shrink-0">
+                  <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8.684 13.342C8.886 12.938 9 12.482 9 12c0-.482-.114-.938-.316-1.342m0 2.684a3 3 0 110-2.684m0 2.684l6.632 3.316m-6.632-6l6.632-3.316m0 0a3 3 0 105.367-2.684 3 3 0 00-5.367 2.684zm0 9.316a3 3 0 105.368 2.684 3 3 0 00-5.368-2.684z" />
+                  </svg>
+                </div>
+                <div>
+                  <h3 className="text-lg font-bold text-gray-900">Partager la wishlist</h3>
+                  <p className="text-xs text-gray-500">Lien invité sans spoiler</p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setShowShareModal(false)}
+                className="text-gray-400 hover:text-gray-700 p-2 rounded-full hover:bg-gray-100 transition cursor-pointer"
+                title="Fermer"
+              >
+                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                </svg>
+              </button>
+            </div>
+
+            <p className="text-sm text-gray-600 leading-relaxed">
+              Donnez ce lien public à vos amis pour qu&apos;ils puissent consulter la liste et réserver des cadeaux sans spoiler vos surprises :
+            </p>
+
+            <div className="flex gap-2 items-center bg-gray-50 border border-gray-200 rounded-xl p-1.5 focus-within:border-blue-500 focus-within:ring-2 focus-within:ring-blue-100 transition-all">
+              <input
+                type="text"
+                readOnly
+                value={typeof window !== 'undefined' ? `${window.location.origin}/liste/${listId}` : ''}
+                className="flex-1 bg-transparent border-none px-2 py-1 text-xs font-mono text-gray-800 outline-none select-all"
+                onClick={(e) => (e.target as HTMLInputElement).select()}
+              />
+              <button
+                type="button"
+                onClick={handleShare}
+                className="bg-blue-600 hover:bg-blue-700 text-white px-3.5 py-1.5 rounded-lg text-xs font-semibold transition shadow-sm shrink-0 cursor-pointer"
+              >
+                {copied ? '✓ Copié !' : 'Copier'}
+              </button>
+            </div>
+
+            {copied && (
+              <p className="text-xs text-emerald-600 font-medium flex items-center gap-1.5">
+                <span>✓</span> Lien copié dans votre presse-papiers !
+              </p>
+            )}
           </div>
         </div>
       )}
