@@ -82,6 +82,7 @@ export async function getListWithItems(listId: string, adminToken?: string) {
 
   const sanitizedItems = items.map((item) => {
     if (isAdmin) {
+      // eslint-disable-next-line @typescript-eslint/no-unused-vars
       const { is_reserved, reserved_by, ...rest } = item;
       return rest;
     }
@@ -156,7 +157,7 @@ export async function updateItem(
   }
 ) {
   assertSupabase();
-  const updatePayload: Record<string, any> = {
+  const updatePayload: Record<string, unknown> = {
     title: data.title,
     price: data.price,
     preference_order: data.preference_order,

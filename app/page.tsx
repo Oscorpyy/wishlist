@@ -26,9 +26,9 @@ export default function HomePage() {
       }
       // Redirect directly with the admin_token key
       router.push(`/liste/${newList.id}?key=${newList.admin_token}`);
-    } catch (err: any) {
+    } catch (err: unknown) {
       console.error(err);
-      const msg = err?.message || 'Failed to create wishlist';
+      const msg = err instanceof Error ? err.message : 'Failed to create wishlist';
       setErrorMsg(msg);
       alert(msg);
     } finally {

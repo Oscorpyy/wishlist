@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useState, useRef, Suspense } from 'react';
+import { useEffect, useState, useRef, useCallback, Suspense } from 'react';
 import { useParams, useSearchParams } from 'next/navigation';
 import { getListWithItems, addItemToList, reserveItem, cancelReservation, updateItem, deleteItem } from '@/app/actions/wishlist';
 import { scrapeProductUrl } from '@/app/actions/scrape';
@@ -30,7 +30,14 @@ function parseItemImages(imageUrl: string | undefined | null): string[] {
     try {
       const parsed = JSON.parse(imageUrl);
       if (Array.isArray(parsed) && parsed.length > 0) {
-        return parsed.filter((u): u is string => typeof u === 'string' && u.trim().length > 0);
+        return parsed.filter(
+          (u): u is string =>
+            typeof u === 'string' &&
+            u.trim().length > 0 &&
+            !u.includes('.01.PT01.') &&
+            !u.includes('.01.PT02.') &&
+            !u.includes('.01.PT03.')
+        );
       }
     } catch {
       // fallback
@@ -83,9 +90,8 @@ function WishlistContent() {
   const [reservingItemId, setReservingItemId] = useState<string | null>(null);
   const [reserverName, setReserverName] = useState('');
 
-  const loadList = async () => {
+  const loadList = useCallback(async () => {
     if (!listId) return;
-    setLoading(true);
 
     // Check URL query param first, then client-side cookie and localStorage
     let effectiveKey = adminKey;
@@ -117,11 +123,12 @@ function WishlistContent() {
       setPreference(maxPref + 1);
     }
     setLoading(false);
-  };
+  }, [listId, adminKey]);
 
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     loadList();
-  }, [listId, adminKey]);
+  }, [loadList]);
 
   const handleShare = () => {
     const guestUrl = `${window.location.origin}/liste/${listId}`;
@@ -132,14 +139,45 @@ function WishlistContent() {
     }, 2000);
   };
 
-  // Modal keyboard navigation
+  // Refs for add-item form keyboard navigation
+  const urlInputRef = useRef<HTMLInputElement>(null);
+  const fieldRef0 = useRef<HTMLInputElement>(null);
+  const fieldRef1 = useRef<HTMLInputElement>(null);
+  const fieldRef2 = useRef<HTMLInputElement>(null);
+  const fieldRef3 = useRef<HTMLInputElement>(null);
+  const fieldRef4 = useRef<HTMLInputElement>(null);
+  const submitRef = useRef<HTMLButtonElement>(null);
+
+  const handleCancelAddItem = () => {
+    setUrl('');
+    setLastScrapedUrl('');
+    setScrapedTitle('');
+    setScrapedImage('');
+    setScrapedImages([]);
+    setScrapedPrice('');
+    setOptions('');
+    setScrapedAvailableOptions({});
+    setTimeout(() => {
+      urlInputRef.current?.focus();
+    }, 50);
+  };
+
+  // Modal & Global keyboard navigation
   useEffect(() => {
-    if (!selectedItem && !editingItem && !showShareModal) return;
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
-        if (showShareModal) setShowShareModal(false);
-        else if (editingItem) setEditingItem(null);
-        else if (selectedItem) setSelectedItem(null);
+        if (showShareModal) {
+          setShowShareModal(false);
+        } else if (editingItem) {
+          setEditingItem(null);
+        } else if (selectedItem) {
+          setSelectedItem(null);
+        } else if (reservingItemId) {
+          setReservingItemId(null);
+          setReserverName('');
+        } else if (scrapedTitle) {
+          handleCancelAddItem();
+        }
       } else if (e.key === 'ArrowLeft' && selectedItem && !editingItem) {
         const images = parseItemImages(selectedItem.image_url);
         if (images.length > 1) {
@@ -154,7 +192,7 @@ function WishlistContent() {
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [selectedItem, editingItem]);
+  }, [selectedItem, editingItem, showShareModal, reservingItemId, scrapedTitle]);
 
   const openEditModal = (item: Item, e?: React.MouseEvent) => {
     if (e) e.stopPropagation();
@@ -237,8 +275,9 @@ function WishlistContent() {
 
       setEditingItem(null);
       await loadList();
-    } catch (err: any) {
-      alert(err.message || 'Erreur lors de la mise à jour');
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'Erreur lors de la mise à jour';
+      alert(msg);
     } finally {
       setSavingEdit(false);
     }
@@ -251,8 +290,9 @@ function WishlistContent() {
       if (selectedItem && selectedItem.id === itemId) setSelectedItem(null);
       if (editingItem && editingItem.id === itemId) setEditingItem(null);
       loadList();
-    } catch (err: any) {
-      alert(err.message || 'Erreur lors de la suppression');
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'Erreur lors de la suppression';
+      alert(msg);
     }
   };
 
@@ -273,19 +313,62 @@ function WishlistContent() {
 
       // Focus the first text zone (Title) so Shift+Enter cycles through fields and Ctrl+Enter saves
       setTimeout(() => {
-        fieldRefs[0].current?.focus();
-        fieldRefs[0].current?.select();
+        fieldRef0.current?.focus();
+        fieldRef0.current?.select();
       }, 50);
     } catch {
       alert('Impossible d’extraire automatiquement les informations du produit. Vous pouvez remplir les champs manuellement.');
       setScrapedTitle('Produit');
       setLastScrapedUrl(url);
       setTimeout(() => {
-        fieldRefs[0].current?.focus();
+        fieldRef0.current?.focus();
       }, 50);
     } finally {
       setScraping(false);
     }
+  };
+
+  const toggleOptionChip = (dimension: string, value: string) => {
+    const currentPairs = options
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean);
+
+    const dimPrefix = `${dimension}:`.toLowerCase();
+    const existingIndex = currentPairs.findIndex((p) =>
+      p.toLowerCase().startsWith(dimPrefix)
+    );
+
+    if (existingIndex !== -1) {
+      const existingVal = currentPairs[existingIndex].slice(dimension.length + 1).trim();
+      if (existingVal.toLowerCase() === value.toLowerCase()) {
+        // Already selected -> toggle off
+        currentPairs.splice(existingIndex, 1);
+      } else {
+        // Change to new value
+        currentPairs[existingIndex] = `${dimension}: ${value}`;
+      }
+    } else {
+      // Add new option
+      currentPairs.push(`${dimension}: ${value}`);
+    }
+
+    setOptions(currentPairs.join(', '));
+  };
+
+  const isOptionSelected = (dimension: string, value: string) => {
+    const currentPairs = options
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean);
+    const dimPrefix = `${dimension}:`.toLowerCase();
+    return currentPairs.some((p) => {
+      const lower = p.toLowerCase();
+      if (lower.startsWith(dimPrefix)) {
+        return lower.slice(dimension.length + 1).trim().toLowerCase() === value.toLowerCase();
+      }
+      return lower === value.toLowerCase();
+    });
   };
 
   const handleAddItem = async (e: React.FormEvent) => {
@@ -293,8 +376,15 @@ function WishlistContent() {
     if (!scrapedTitle || !listId) return;
 
     let imagePayload = scrapedImage;
-    if (scrapedImages.length > 1 && (scrapedImages[0] === scrapedImage || !scrapedImage)) {
-      imagePayload = JSON.stringify(scrapedImages);
+    if (scrapedImages.length > 1) {
+      if (scrapedImages.includes(scrapedImage)) {
+        const reordered = [scrapedImage, ...scrapedImages.filter((u) => u !== scrapedImage)];
+        imagePayload = JSON.stringify(reordered);
+      } else if (scrapedImage) {
+        imagePayload = JSON.stringify([scrapedImage, ...scrapedImages]);
+      } else {
+        imagePayload = JSON.stringify(scrapedImages);
+      }
     } else if (scrapedImage) {
       imagePayload = JSON.stringify([scrapedImage]);
     }
@@ -312,19 +402,8 @@ function WishlistContent() {
     const maxPref = data?.items?.reduce((max, item) => Math.max(max, item.preference_order || 0), 0) ?? 0;
     setPreference(Math.max(maxPref, preference) + 1);
 
-    setUrl('');
-    setLastScrapedUrl('');
-    setScrapedTitle('');
-    setScrapedImage('');
-    setScrapedImages([]);
-    setScrapedPrice('');
-    setOptions('');
-    setScrapedAvailableOptions({});
+    handleCancelAddItem();
     loadList();
-
-    setTimeout(() => {
-      urlInputRef.current?.focus();
-    }, 50);
   };
 
   const handleReserve = async (itemId: string) => {
@@ -357,29 +436,26 @@ function WishlistContent() {
         });
       }
       await loadList();
-    } catch (err: any) {
-      alert(err?.message || 'Erreur lors de l’annulation de la réservation');
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'Erreur lors de l’annulation de la réservation';
+      alert(msg);
     }
   };
 
-  // Refs for add-item form keyboard navigation (Shift+Enter = cycle fields, Ctrl+Enter = validate)
-  const urlInputRef = useRef<HTMLInputElement>(null);
-  const fieldRef0 = useRef<HTMLInputElement>(null);
-  const fieldRef1 = useRef<HTMLInputElement>(null);
-  const fieldRef2 = useRef<HTMLInputElement>(null);
-  const fieldRef3 = useRef<HTMLInputElement>(null);
-  const fieldRef4 = useRef<HTMLInputElement>(null);
-  const submitRef = useRef<HTMLButtonElement>(null);
-  const fieldRefs = [fieldRef0, fieldRef1, fieldRef2, fieldRef3, fieldRef4];
-
   const handleFormKeyDown = (e: React.KeyboardEvent<HTMLInputElement>, index: number) => {
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      handleCancelAddItem();
+      return;
+    }
     if (e.key === 'Enter') {
       if (e.shiftKey) {
         // Shift + Enter: Strictly navigates between text zones
         e.preventDefault();
-        if (index < fieldRefs.length - 1) {
-          fieldRefs[index + 1].current?.focus();
-          fieldRefs[index + 1].current?.select();
+        const refs = [fieldRef0, fieldRef1, fieldRef2, fieldRef3, fieldRef4];
+        if (index < refs.length - 1) {
+          refs[index + 1].current?.focus();
+          refs[index + 1].current?.select();
         } else {
           // Loop back to URL input or first field
           urlInputRef.current?.focus();
@@ -441,17 +517,22 @@ function WishlistContent() {
             <input
               ref={urlInputRef}
               type="url"
-              placeholder="Paste product link (Amazon, Maxesport...)"
+              placeholder="Paste product link (Amazon, Maxesport, Rhinoshield, Fnac...)"
               value={url}
               disabled={scraping}
               onChange={(e) => setUrl(e.target.value)}
               onKeyDown={async (e) => {
+                if (e.key === 'Escape') {
+                  e.preventDefault();
+                  handleCancelAddItem();
+                  return;
+                }
                 if (e.key === 'Enter') {
                   if (e.shiftKey) {
                     e.preventDefault();
                     if (scrapedTitle) {
-                      fieldRefs[0].current?.focus();
-                      fieldRefs[0].current?.select();
+                      fieldRef0.current?.focus();
+                      fieldRef0.current?.select();
                     }
                   } else if (e.ctrlKey || e.metaKey) {
                     e.preventDefault();
@@ -473,6 +554,16 @@ function WishlistContent() {
               }}
               className="flex-1 border rounded-lg px-3 py-2 text-black disabled:opacity-60"
             />
+            {scrapedTitle && (
+              <button
+                type="button"
+                onClick={handleCancelAddItem}
+                className="bg-gray-100 hover:bg-gray-200 text-gray-700 px-3.5 py-2 rounded-lg transition font-medium cursor-pointer shrink-0 border border-gray-300"
+                title="Annuler et fermer (Échap)"
+              >
+                ✕
+              </button>
+            )}
             <button
               type="button"
               onClick={scrapedTitle ? () => submitRef.current?.click() : handleScrape}
@@ -487,13 +578,13 @@ function WishlistContent() {
             <form onSubmit={handleAddItem} className="space-y-3 pt-4 border-t">
               {/* Keyboard hint */}
               <p className="text-xs text-gray-500 italic">
-                💡 <kbd className="bg-gray-100 border border-gray-300 rounded px-1.5 py-0.5 text-[11px] font-mono font-semibold text-gray-700">Shift</kbd> + <kbd className="bg-gray-100 border border-gray-300 rounded px-1.5 py-0.5 text-[11px] font-mono font-semibold text-gray-700">↵</kbd> naviguer entre les champs &nbsp;·&nbsp; <kbd className="bg-gray-100 border border-gray-300 rounded px-1.5 py-0.5 text-[11px] font-mono font-semibold text-gray-700">Ctrl</kbd> + <kbd className="bg-gray-100 border border-gray-300 rounded px-1.5 py-0.5 text-[11px] font-mono font-semibold text-gray-700">↵</kbd> valider l&apos;article
+                💡 <kbd className="bg-gray-100 border border-gray-300 rounded px-1.5 py-0.5 text-[11px] font-mono font-semibold text-gray-700">Échap</kbd> annuler l&apos;ajout &nbsp;·&nbsp; <kbd className="bg-gray-100 border border-gray-300 rounded px-1.5 py-0.5 text-[11px] font-mono font-semibold text-gray-700">Shift</kbd> + <kbd className="bg-gray-100 border border-gray-300 rounded px-1.5 py-0.5 text-[11px] font-mono font-semibold text-gray-700">↵</kbd> naviguer entre les champs &nbsp;·&nbsp; <kbd className="bg-gray-100 border border-gray-300 rounded px-1.5 py-0.5 text-[11px] font-mono font-semibold text-gray-700">Ctrl</kbd> + <kbd className="bg-gray-100 border border-gray-300 rounded px-1.5 py-0.5 text-[11px] font-mono font-semibold text-gray-700">↵</kbd> valider l&apos;article
               </p>
 
               <div>
                 <label className="block text-sm font-medium text-gray-700">Title</label>
                 <input
-                  ref={fieldRefs[0]}
+                  ref={fieldRef0}
                   type="text"
                   value={scrapedTitle}
                   onChange={(e) => setScrapedTitle(e.target.value)}
@@ -518,22 +609,61 @@ function WishlistContent() {
                     </div>
                   )}
                   <input
-                    ref={fieldRefs[1]}
+                    ref={fieldRef1}
                     type="url"
                     placeholder="https://... (or auto-detected from product page)"
                     value={scrapedImage}
                     onKeyDown={(e) => handleFormKeyDown(e, 1)}
                     onChange={(e) => {
                       setScrapedImage(e.target.value);
-                      setScrapedImages(e.target.value ? [e.target.value] : []);
+                      if (e.target.value && !scrapedImages.includes(e.target.value)) {
+                        setScrapedImages([e.target.value, ...scrapedImages]);
+                      }
                     }}
                     className="flex-1 border rounded-lg px-3 py-2 text-black text-sm"
                   />
                 </div>
+
+                {/* Detected photos gallery: user can click to choose which photo is the primary cover photo */}
                 {scrapedImages.length > 1 && (
-                  <p className="text-xs text-gray-500 mt-1">
-                    ✓ {scrapedImages.length} images automatically detected for the gallery
-                  </p>
+                  <div className="mt-2.5 space-y-1.5">
+                    <p className="text-xs text-gray-600 font-medium flex items-center gap-1.5">
+                      <span>📸</span>
+                      <span>Photos détectées (cliquez pour choisir l&apos;image principale) :</span>
+                    </p>
+                    <div className="flex gap-2 overflow-x-auto p-2 bg-gray-50 rounded-xl border border-gray-200">
+                      {scrapedImages.map((img, idx) => {
+                        const isMain = scrapedImage === img;
+                        return (
+                          <button
+                            key={idx}
+                            type="button"
+                            onClick={() => setScrapedImage(img)}
+                            className={`relative w-16 h-16 rounded-xl border-2 p-1 bg-white shrink-0 cursor-pointer transition-all ${
+                              isMain
+                                ? 'border-blue-600 ring-2 ring-blue-100 shadow-md scale-105'
+                                : 'border-gray-200 opacity-60 hover:opacity-100 hover:border-gray-300'
+                            }`}
+                            title="Définir comme image principale"
+                          >
+                            <img
+                              src={img}
+                              alt=""
+                              className="w-full h-full object-contain rounded-lg"
+                              onError={() => {
+                                setScrapedImages((prev) => prev.filter((u) => u !== img));
+                              }}
+                            />
+                            {isMain && (
+                              <span className="absolute -top-1.5 -right-1.5 bg-blue-600 text-white rounded-full w-4 h-4 flex items-center justify-center text-[10px] font-bold shadow">
+                                ✓
+                              </span>
+                            )}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
                 )}
               </div>
 
@@ -541,7 +671,7 @@ function WishlistContent() {
                 <div>
                   <label className="block text-sm font-medium text-gray-700">Price (€)</label>
                   <input
-                    ref={fieldRefs[2]}
+                    ref={fieldRef2}
                     type="number"
                     step="0.01"
                     value={scrapedPrice}
@@ -555,7 +685,7 @@ function WishlistContent() {
                     Preference Rank (1 = Top)
                   </label>
                   <input
-                    ref={fieldRefs[3]}
+                    ref={fieldRef3}
                     type="number"
                     value={preference}
                     onChange={(e) => setPreference(parseInt(e.target.value) || 1)}
@@ -570,7 +700,7 @@ function WishlistContent() {
                   Options / Notes (Couleur, Taille, Version...)
                 </label>
                 <input
-                  ref={fieldRefs[4]}
+                  ref={fieldRef4}
                   type="text"
                   placeholder="e.g. Taille: 5 m, Couleur: Blanc"
                   value={options}
@@ -581,50 +711,36 @@ function WishlistContent() {
 
                 {/* Detected options chips from the store */}
                 {Object.entries(scrapedAvailableOptions).length > 0 && (
-                  <div className="mt-2.5 p-3 bg-gray-50 rounded-xl border border-gray-200 space-y-2">
-                    <p className="text-xs font-semibold text-gray-600 uppercase tracking-wide">
-                      Options détectées sur le site (cliquez pour sélectionner) :
-                    </p>
+                  <div className="mt-2.5 p-3.5 bg-gray-50 rounded-xl border border-gray-200 space-y-2.5">
+                    <div className="flex items-center justify-between">
+                      <p className="text-xs font-semibold text-gray-700 uppercase tracking-wide flex items-center gap-1.5">
+                        <span>🏷️</span>
+                        <span>Options détectées sur le site (cliquez pour sélectionner) :</span>
+                      </p>
+                      {options && (
+                        <button
+                          type="button"
+                          onClick={() => setOptions('')}
+                          className="text-[11px] text-gray-500 hover:text-red-600 underline cursor-pointer"
+                        >
+                          Effacer tout
+                        </button>
+                      )}
+                    </div>
                     {Object.entries(scrapedAvailableOptions).map(([dimension, values]) => (
                       <div key={dimension} className="space-y-1">
-                        <span className="text-xs font-medium text-gray-700">{dimension} :</span>
+                        <span className="text-xs font-semibold text-gray-700">{dimension} :</span>
                         <div className="flex flex-wrap gap-1.5">
                           {values.map((val) => {
-                            const optStr = `${dimension}: ${val}`;
-                            const escapedVal = val.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-                            const escapedDim = dimension.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-                            const isSelected =
-                              options.includes(optStr) ||
-                              new RegExp(`${escapedDim}:\\s*${escapedVal}(?:[,;]|$)`, 'i').test(options) ||
-                              new RegExp(`(^|[,;\\s])${escapedVal}([,;\\s]|$)`, 'i').test(options);
-
+                            const isSelected = isOptionSelected(dimension, val);
                             return (
                               <button
                                 key={val}
                                 type="button"
-                                onClick={() => {
-                                  let newOptions = options;
-                                  if (isSelected) {
-                                    const pattern = new RegExp(`(?:${escapedDim}:\\s*)?${escapedVal}(?:[,;\\s]*)`, 'i');
-                                    newOptions = newOptions
-                                      .replace(pattern, '')
-                                      .replace(/,\s*,/g, ',')
-                                      .replace(/^[\s,]+|[\s,]+$/g, '');
-                                  } else if (newOptions.includes(`${dimension}:`)) {
-                                    newOptions = newOptions.replace(
-                                      new RegExp(`${escapedDim}:\\s*[^,;]+`, 'i'),
-                                      optStr
-                                    );
-                                  } else if (newOptions.trim()) {
-                                    newOptions = `${newOptions}, ${optStr}`;
-                                  } else {
-                                    newOptions = optStr;
-                                  }
-                                  setOptions(newOptions.trim());
-                                }}
-                                className={`text-xs px-2.5 py-1 rounded-lg border transition-all cursor-pointer ${
+                                onClick={() => toggleOptionChip(dimension, val)}
+                                className={`text-xs px-2.5 py-1 rounded-lg border transition-all cursor-pointer font-medium ${
                                   isSelected
-                                    ? 'bg-blue-600 border-blue-600 text-white font-semibold shadow-sm'
+                                    ? 'bg-blue-600 border-blue-600 text-white font-semibold shadow-sm ring-1 ring-blue-300'
                                     : 'bg-white border-gray-300 text-gray-700 hover:border-gray-400 hover:bg-gray-100'
                                 }`}
                               >
@@ -638,13 +754,23 @@ function WishlistContent() {
                   </div>
                 )}
               </div>
-              <button
-                ref={submitRef}
-                type="submit"
-                className="w-full bg-green-600 text-white py-2 rounded-lg font-medium hover:bg-green-700"
-              >
-                Save Item
-              </button>
+              <div className="flex gap-2.5 pt-2">
+                <button
+                  ref={submitRef}
+                  type="submit"
+                  className="flex-1 bg-green-600 hover:bg-green-700 text-white py-2.5 rounded-xl font-semibold transition shadow-sm cursor-pointer"
+                >
+                  Ajouter l&apos;article
+                </button>
+                <button
+                  type="button"
+                  onClick={handleCancelAddItem}
+                  className="bg-gray-100 hover:bg-gray-200 text-gray-700 px-4 py-2.5 rounded-xl font-medium text-sm transition border border-gray-300 cursor-pointer"
+                  title="Annuler et fermer ce formulaire (Échap)"
+                >
+                  Annuler (Échap)
+                </button>
+              </div>
             </form>
           )}
         </section>

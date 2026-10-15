@@ -1,5 +1,7 @@
 'use server';
 
+import * as cheerio from 'cheerio';
+
 export interface ScrapedProduct {
   title: string;
   image: string;
@@ -50,26 +52,41 @@ function decodeHtmlEntities(text: string): string {
 }
 
 /**
- * Parses numeric price from text or numbers, supporting Euro (12,99 €), USD ($12.99), GBP, etc.
+ * Robust numeric price parser supporting French formats (12,99 €, 1 299,00 €),
+ * USD ($12.99), GBP (£12.99), EUR, etc. Handles discounts by capturing the first valid amount.
  */
 function parsePrice(raw: string | number | null | undefined): number | null {
   if (raw === null || raw === undefined) return null;
-  if (typeof raw === 'number') return isNaN(raw) ? null : raw;
-  let clean = String(raw).trim().replace(/\s/g, '');
+  if (typeof raw === 'number') return isNaN(raw) ? null : Math.round(raw * 100) / 100;
+  const str = String(raw).replace(/\u00A0|&nbsp;/g, ' ').trim();
 
-  if (clean.includes('.') && clean.includes(',')) {
-    if (clean.lastIndexOf(',') > clean.lastIndexOf('.')) {
-      clean = clean.replace(/\./g, '').replace(',', '.');
-    } else {
-      clean = clean.replace(/,/g, '');
+  const priceRegexes = [
+    /(?:€|\$|£|EUR|USD|GBP)\s*([0-9]{1,3}(?:[,\s.][0-9]{3})*(?:[.,][0-9]{1,2})|[0-9]+(?:[.,][0-9]{1,2})?)/i,
+    /([0-9]{1,3}(?:[,\s.][0-9]{3})*(?:[.,][0-9]{1,2})|[0-9]+(?:[.,][0-9]{1,2})?)\s*(?:€|\$|£|EUR|USD|GBP)/i,
+    /\b([0-9]{1,4}(?:[.,][0-9]{1,2}))\b/,
+    /\b([0-9]+)\b/,
+  ];
+
+  for (const reg of priceRegexes) {
+    const m = str.match(reg);
+    if (m && m[1]) {
+      let numStr = m[1].replace(/\s/g, '');
+      if (numStr.includes('.') && numStr.includes(',')) {
+        if (numStr.lastIndexOf(',') > numStr.lastIndexOf('.')) {
+          numStr = numStr.replace(/\./g, '').replace(',', '.');
+        } else {
+          numStr = numStr.replace(/,/g, '');
+        }
+      } else if (numStr.includes(',')) {
+        numStr = numStr.replace(',', '.');
+      }
+      const val = parseFloat(numStr);
+      if (!isNaN(val) && val > 0 && val < 500000) {
+        return Math.round(val * 100) / 100;
+      }
     }
-  } else if (clean.includes(',')) {
-    clean = clean.replace(',', '.');
   }
-
-  clean = clean.replace(/[^0-9.]/g, '');
-  const parsed = parseFloat(clean);
-  return isNaN(parsed) ? null : parsed;
+  return null;
 }
 
 /**
@@ -84,7 +101,6 @@ function cleanTitle(title: string): string {
     /\s*[-|:]\s*RHINOSHIELD(?:\s+France)?$/i,
     /\s*[-|:]\s*Maxesport(?:\s+France)?$/i,
     /\s*[-|:]\s*Displate(?:\.com)?$/i,
-    /\s*[-|:]\s*Space Exploration.*$/i,
     /\s*[-|:]\s*Fnac(?:\.com)?$/i,
     /\s*[-|:]\s*Darty(?:\.com)?$/i,
     /\s*[-|:]\s*Boulanger(?:\.com)?$/i,
@@ -113,7 +129,6 @@ function cleanTitle(title: string): string {
     cleaned = cleaned.replace(s, '');
   }
 
-  // Remove leading store prefixes (e.g. "Amazon.fr : ", "Displate - ")
   cleaned = cleaned.replace(/^Amazon(?:\.[a-z]{2,3})?\s*:\s*/i, '');
   cleaned = cleaned.replace(/^RHINOSHIELD(?:\s+France)?\s*[-|:]\s*/i, '');
   cleaned = cleaned.replace(/^Displate\s*[-|:]\s*/i, '');
@@ -122,7 +137,7 @@ function cleanTitle(title: string): string {
 }
 
 /**
- * Fallback to generate a clean product title from the URL slug when bot shields block page rendering.
+ * Fallback to generate a clean product title from the URL slug when pages are blocked.
  */
 function slugToTitle(url: string): string {
   try {
@@ -162,210 +177,62 @@ function slugToTitle(url: string): string {
 }
 
 /**
- * Extracts meta tag content by property or name attribute.
+ * Normalizes image URL, resolves relative paths, upgrades resolution,
+ * and discards icons, tracking pixels, badges, SVGs.
  */
-function extractMetaContent(html: string, nameOrProperty: string): string | null {
-  const escaped = nameOrProperty.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const tagRegex = new RegExp(`<meta(?=[^>]*\\b(?:property|name)\\s*=\\s*["']${escaped}["'])[^>]*>`, 'i');
-  const tagMatch = html.match(tagRegex);
-  if (!tagMatch) return null;
-
-  const contentMatch = tagMatch[0].match(/\bcontent\s*=\s*(?:"([^"]*)"|'([^']*)'|([^"'\s>]+))/i);
-  if (!contentMatch) return null;
-
-  const raw = contentMatch[1] ?? contentMatch[2] ?? contentMatch[3] ?? null;
-  return raw !== null ? decodeHtmlEntities(raw) : null;
-}
-
-/**
- * Recursively parses JSON-LD scripts to find Schema.org Product / ProductGroup metadata and variants.
- */
-function extractJsonLd(html: string): {
-  title: string;
-  images: string[];
-  price: number | null;
-  brand?: string;
-  availableOptions: Record<string, string[]>;
-  options: string;
-} | null {
-  const jsonLdScripts = [...html.matchAll(/<script\b[^>]*type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi)];
-  let bestProduct: any = null;
-
-  for (const s of jsonLdScripts) {
-    try {
-      const parsed = JSON.parse(s[1].trim());
-      const findProduct = (obj: any) => {
-        if (!obj || typeof obj !== 'object') return;
-        const type = obj['@type'];
-        const isProd =
-          type === 'Product' ||
-          type === 'ProductGroup' ||
-          type === 'ProductModel' ||
-          (Array.isArray(type) && (type.includes('Product') || type.includes('ProductGroup')));
-        if (isProd && (!bestProduct || (obj.offers && !bestProduct.offers) || (obj.hasVariant && !bestProduct.hasVariant))) {
-          bestProduct = obj;
-        }
-        if (Array.isArray(obj)) {
-          obj.forEach(findProduct);
-        }
-        if (obj['@graph'] && Array.isArray(obj['@graph'])) {
-          obj['@graph'].forEach(findProduct);
-        }
-      };
-      findProduct(parsed);
-    } catch {
-      // ignore JSON parse error in individual scripts
-    }
+function normalizeImageUrl(rawUrl: string | undefined | null, baseUrl: string): string | null {
+  if (!rawUrl || typeof rawUrl !== 'string') return null;
+  let trimmed = rawUrl.trim();
+  if (
+    !trimmed ||
+    trimmed.startsWith('data:') ||
+    trimmed.includes('grey-pixel') ||
+    trimmed.includes('placeholder') ||
+    trimmed.includes('spinner') ||
+    trimmed.includes('loading') ||
+    trimmed.includes('logo') ||
+    trimmed.includes('badge') ||
+    trimmed.includes('payment') ||
+    trimmed.includes('paypal') ||
+    trimmed.includes('visa') ||
+    trimmed.includes('icon') ||
+    trimmed.includes('avatar') ||
+    trimmed.includes('aplus-media') ||
+    trimmed.includes('amazon-avatars') ||
+    trimmed.includes('community-reviews') ||
+    trimmed.includes('transparent') ||
+    trimmed.includes('spacer') ||
+    trimmed.includes('pixel') ||
+    trimmed.includes('play-button') ||
+    trimmed.includes('video') ||
+    trimmed.includes('stars') ||
+    trimmed.includes('rating') ||
+    trimmed.includes('banner') ||
+    trimmed.includes('sprite') ||
+    trimmed.endsWith('.svg') ||
+    /\b(blank|1x1|spacer)\.(gif|png|jpe?g)/i.test(trimmed)
+  ) {
+    return null;
   }
 
-  if (!bestProduct) return null;
-
-  const title = bestProduct.name || bestProduct.headline || '';
-  const images: string[] = [];
-  if (bestProduct.image) {
-    if (Array.isArray(bestProduct.image)) {
-      bestProduct.image.forEach((img: any) => {
-        const u = typeof img === 'string' ? img : img?.url || img?.contentUrl;
-        if (u && !images.includes(u)) images.push(u);
-      });
-    } else if (typeof bestProduct.image === 'string') {
-      images.push(bestProduct.image);
-    } else if (bestProduct.image.url) {
-      images.push(bestProduct.image.url);
-    }
+  try {
+    trimmed = new URL(trimmed, baseUrl).href;
+  } catch {
+    return null;
   }
 
-  let price: number | null = null;
-  if (bestProduct.offers) {
-    const off = bestProduct.offers;
-    if (Array.isArray(off)) {
-      for (const o of off) {
-        const p = parsePrice(o.price ?? o.lowPrice ?? o.highPrice);
-        if (p !== null) {
-          price = p;
-          break;
-        }
-      }
-    } else if (typeof off === 'object') {
-      price = parsePrice(off.price ?? off.lowPrice ?? off.highPrice ?? off.priceSpecification?.price);
-    }
+  // Reject invalid amazon.fr/dp/ relative image URLs
+  if (trimmed.includes('amazon.') && (trimmed.includes('/dp/') || trimmed.includes('/gp/'))) {
+    return null;
   }
 
-  const availableOptions: Record<string, string[]> = {};
-  const selectedOptionsList: string[] = [];
+  // Remove Amazon dynamic downscaling (e.g. ._AC_US40_.jpg -> .jpg)
+  trimmed = trimmed.replace(/\._[A-Z0-9,_]+_\.(jpg|png|webp)$/i, '.$1');
 
-  // Parse variants from hasVariant or variants
-  const variants = bestProduct.hasVariant || bestProduct.variants || [];
-  if (Array.isArray(variants)) {
-    for (const v of variants) {
-      if (!v || typeof v !== 'object') continue;
-      if (v.color) {
-        const c = String(v.color).trim();
-        if (c) {
-          if (!availableOptions['Couleur']) availableOptions['Couleur'] = [];
-          if (!availableOptions['Couleur'].includes(c)) availableOptions['Couleur'].push(c);
-        }
-      }
-      if (v.size) {
-        const sz = String(v.size).trim();
-        if (sz) {
-          if (!availableOptions['Taille']) availableOptions['Taille'] = [];
-          if (!availableOptions['Taille'].includes(sz)) availableOptions['Taille'].push(sz);
-        }
-      }
-      if (v.material) {
-        const m = String(v.material).trim();
-        if (m) {
-          if (!availableOptions['Matière']) availableOptions['Matière'] = [];
-          if (!availableOptions['Matière'].includes(m)) availableOptions['Matière'].push(m);
-        }
-      }
-      if (v.pattern) {
-        const pat = String(v.pattern).trim();
-        if (pat) {
-          if (!availableOptions['Modèle']) availableOptions['Modèle'] = [];
-          if (!availableOptions['Modèle'].includes(pat)) availableOptions['Modèle'].push(pat);
-        }
-      }
-      if (price === null && v.offers) {
-        const vp = Array.isArray(v.offers) ? v.offers[0]?.price : v.offers?.price;
-        if (vp) price = parsePrice(vp);
-      }
-      if (v.image && images.length < 10) {
-        const imgUrl = typeof v.image === 'string' ? v.image : v.image?.url;
-        if (imgUrl && !images.includes(imgUrl)) images.push(imgUrl);
-      }
-    }
-  }
+  // Remove Shopify thumbnail downscaling (e.g. _100x100.jpg -> .jpg)
+  trimmed = trimmed.replace(/_(?:small|thumb|compact|medium|100x100|150x150|200x200|300x300)\.(jpg|png|webp)/i, '.$1');
 
-  // Check if offers array has named options
-  if (Array.isArray(bestProduct.offers)) {
-    for (const o of bestProduct.offers) {
-      if (o.name && typeof o.name === 'string' && o.name !== title && o.name.length < 50) {
-        if (!availableOptions['Option']) availableOptions['Option'] = [];
-        if (!availableOptions['Option'].includes(o.name)) availableOptions['Option'].push(o.name);
-      }
-    }
-  }
-
-  return {
-    title,
-    images,
-    price,
-    brand: typeof bestProduct.brand === 'object' ? bestProduct.brand?.name : bestProduct.brand,
-    availableOptions,
-    options: selectedOptionsList.join(', '),
-  };
-}
-
-/**
- * Safely parses a balanced JSON block from HTML text starting from a given search key.
- */
-function extractJsonBlock(text: string, searchKey: string): any | null {
-  const keyIndex = text.indexOf(searchKey);
-  if (keyIndex === -1) return null;
-
-  const braceStart = text.indexOf('{', keyIndex);
-  if (braceStart === -1) return null;
-
-  let depth = 0;
-  let inString = false;
-  let quoteChar = '';
-  let escape = false;
-
-  for (let i = braceStart; i < text.length && i < braceStart + 50000; i++) {
-    const char = text[i];
-    if (escape) {
-      escape = false;
-      continue;
-    }
-    if (char === '\\') {
-      escape = true;
-      continue;
-    }
-    if (inString) {
-      if (char === quoteChar) inString = false;
-      continue;
-    }
-    if (char === '"' || char === "'") {
-      inString = true;
-      quoteChar = char;
-      continue;
-    }
-    if (char === '{') {
-      depth++;
-    } else if (char === '}') {
-      depth--;
-      if (depth === 0) {
-        try {
-          return JSON.parse(text.slice(braceStart, i + 1));
-        } catch {
-          return null;
-        }
-      }
-    }
-  }
-  return null;
+  return trimmed;
 }
 
 /**
@@ -373,14 +240,14 @@ function extractJsonBlock(text: string, searchKey: string): any | null {
  */
 function translateDimension(dim: string): string {
   const lower = (dim || '').trim().toLowerCase();
-  if (lower === 'size' || lower === 'sizes') return 'Taille';
+  if (lower === 'size' || lower === 'sizes' || lower === 'size_name') return 'Taille';
   if (lower === 'shoe size' || lower === 'shoe sizes') return 'Pointure';
-  if (lower === 'color' || lower === 'colour' || lower === 'colors' || lower === 'couleurs') return 'Couleur';
+  if (lower === 'color' || lower === 'colour' || lower === 'colors' || lower === 'couleurs' || lower === 'color_name') return 'Couleur';
   if (lower === 'model' || lower === 'models' || lower === 'pattern' || lower === 'device') return 'Modèle';
-  if (lower === 'capacity' || lower === 'storage' || lower === 'memory' || lower === 'rom') return 'Capacité';
+  if (lower === 'capacity' || lower === 'storage' || lower === 'memory' || lower === 'rom' || lower === 'hard_disk_size') return 'Capacité';
   if (lower === 'ram') return 'RAM';
-  if (lower === 'style' || lower === 'styles') return 'Style';
-  if (lower === 'material' || lower === 'materials') return 'Matière';
+  if (lower === 'resolution' || lower === 'résolution' || lower === 'max_resolution') return 'Résolution';
+  if (lower === 'style' || lower === 'styles' || lower === 'style_name') return 'Style';
   if (lower === 'edition' || lower === 'editions') return 'Édition';
   if (lower === 'finish' || lower === 'finition') return 'Finition';
   if (lower === 'frame' || lower === 'frames' || lower === 'cadre' || lower === 'cadres') return 'Cadre';
@@ -396,177 +263,7 @@ function translateDimension(dim: string): string {
 }
 
 /**
- * Intelligently suggests contextual options (sizes, colors, storage, models, finishes)
- * based on product category, title keywords, and store brand.
- */
-function enrichOptions(
-  availableOptions: Record<string, string[]>,
-  title: string,
-  url: string
-): Record<string, string[]> {
-  const options: Record<string, string[]> = { ...availableOptions };
-  const lowerTitle = (title || '').toLowerCase();
-  const lowerUrl = (url || '').toLowerCase();
-
-  // Wall art / Posters / Displate / Desenio / Neons / Prints
-  if (
-    lowerUrl.includes('displate') ||
-    lowerUrl.includes('desenio') ||
-    lowerUrl.includes('posterlounge') ||
-    lowerUrl.includes('redbubble') ||
-    /\b(poster|affiche|tableau|displate|wall art|metal print|toile|impression|art print|neon|enseigne|peinture)\b/i.test(
-      lowerTitle
-    )
-  ) {
-    if (!options['Taille']) {
-      options['Taille'] = ['M (45x32 cm)', 'L (67.5x48 cm)', 'XL (90x64 cm)'];
-    }
-    if (!options['Finition']) {
-      options['Finition'] = ['Matte', 'Brillante (Gloss)'];
-    }
-    if (!options['Cadre']) {
-      options['Cadre'] = ['Sans cadre', 'Cadre Noir', 'Cadre Blanc', 'Cadre Graphite', 'Cadre Bois Naturel'];
-    }
-  }
-
-  // Rhinoshield
-  if (lowerUrl.includes('rhinoshield')) {
-    if (!options['Modèle']) {
-      try {
-        const pUrl = new URL(url);
-        const dev = pUrl.searchParams.get('device');
-        if (dev) {
-          const cleanDev = dev.replace(/-/g, ' ').replace(/\b\w/g, (l) => l.toUpperCase());
-          options['Modèle'] = [cleanDev, 'iPhone 16 Pro Max', 'iPhone 16 Pro', 'iPhone 16', 'iPhone 15 Pro'];
-        } else {
-          options['Modèle'] = ['iPhone 16 Pro Max', 'iPhone 16 Pro', 'iPhone 16', 'iPhone 15 Pro'];
-        }
-      } catch {
-        options['Modèle'] = ['iPhone 16 Pro Max', 'iPhone 16 Pro', 'iPhone 16'];
-      }
-    }
-    if (!options['Finition']) {
-      options['Finition'] = ['Mat', 'Transparent', 'Fibre de Carbone', 'Bordure Noire'];
-    }
-    if (!options['Compatibilité']) {
-      options['Compatibilité'] = ['Compatible MagSafe', 'Standard'];
-    }
-  }
-
-  // Fashion & Clothing (t-shirts, hoodies, pants, jackets, etc.)
-  if (
-    /\b(t-?shirt|chemise|sweat|hoodie|pull|veste|jacket|manteau|pantalon|jean|short|maillot|robe|jupe|blouson|polo)\b/i.test(
-      lowerTitle
-    )
-  ) {
-    if (!options['Taille']) {
-      options['Taille'] = ['XS', 'S', 'M', 'L', 'XL', '2XL', '3XL'];
-    }
-    if (!options['Couleur']) {
-      options['Couleur'] = ['Noir', 'Blanc', 'Gris', 'Bleu', 'Kaki', 'Beige'];
-    }
-  }
-
-  // Shoes & Footwear (sneakers, boots, slides)
-  if (
-    /\b(chaussures?|baskets?|sneakers?|sandales?|bottes?|crocs|claquettes?|air force|dunk|jordan|boots)\b/i.test(
-      lowerTitle
-    )
-  ) {
-    if (!options['Pointure']) {
-      options['Pointure'] = ['38', '39', '40', '41', '42', '43', '44', '45', '46'];
-    }
-    if (!options['Couleur']) {
-      options['Couleur'] = ['Noir', 'Blanc', 'Gris', 'Bleu', 'Beige'];
-    }
-  }
-
-  // Video Games & Consoles
-  if (
-    /\b(jeu|game|playstation|ps5|ps4|xbox|nintendo|switch|steam|zelda|pokemon|mario|gta|fifa|call of duty|elden ring)\b/i.test(
-      lowerTitle
-    )
-  ) {
-    if (!options['Plateforme']) {
-      options['Plateforme'] = ['PlayStation 5', 'Nintendo Switch', 'Xbox Series X', 'PC'];
-    }
-    if (!options['Édition']) {
-      options['Édition'] = ['Standard', 'Deluxe', 'Collector'];
-    }
-  }
-
-  // Smartphones, Tablets, Laptops
-  if (/\b(iphone|ipad|galaxy|smartphone|pixel|macbook|laptop|tablette)\b/i.test(lowerTitle)) {
-    if (!options['Capacité']) {
-      options['Capacité'] = ['128 Go', '256 Go', '512 Go', '1 To'];
-    }
-    if (!options['Couleur']) {
-      options['Couleur'] = ['Noir', 'Blanc', 'Titane', 'Bleu', 'Argent'];
-    }
-  }
-
-  // Smartwatches / Connected watches
-  if (/\b(apple watch|galaxy watch|smartwatch|montre connectée|garmin)\b/i.test(lowerTitle)) {
-    if (!options['Boîtier']) {
-      options['Boîtier'] = ['40 mm', '41 mm', '44 mm', '45 mm', '49 mm'];
-    }
-    if (!options['Connectivité']) {
-      options['Connectivité'] = ['GPS', 'GPS + Cellular'];
-    }
-  }
-
-  // Gaming / Peripherals
-  if (
-    /\b(manette|controller|souris|mouse|clavier|keyboard|casque|headset|écouteurs|earbuds|airpods|superlight)\b/i.test(
-      lowerTitle
-    )
-  ) {
-    if (!options['Couleur']) {
-      options['Couleur'] = ['Noir', 'Blanc'];
-    }
-    if (!options['Connexion'] && !lowerTitle.includes('airpods')) {
-      options['Connexion'] = ['Sans fil', 'Filaire'];
-    }
-  }
-
-  // Books / Mangas / Comics
-  if (/\b(manga|roman|livre|tome|bd|comics)\b/i.test(lowerTitle)) {
-    if (!options['Format']) {
-      options['Format'] = ['Broché', 'Relié', 'Poche', 'Ebook / Kindle'];
-    }
-  }
-
-  // Perfumes & Cosmetics
-  if (/\b(parfum|eau de parfum|eau de toilette|serum|creme|fragrance)\b/i.test(lowerTitle)) {
-    if (!options['Contenance']) {
-      options['Contenance'] = ['30 ml', '50 ml', '100 ml', '200 ml'];
-    }
-  }
-
-  // Jewelry & Rings
-  if (/\b(bague|collier|bracelet|bijou|boucles d'oreilles)\b/i.test(lowerTitle)) {
-    if (!options['Matière']) {
-      options['Matière'] = ['Argent 925', 'Plaqué Or', 'Acier Inoxydable'];
-    }
-    if (lowerTitle.includes('bague') && !options['Taille']) {
-      options['Taille'] = ['50', '52', '54', '56', '58'];
-    }
-  }
-
-  // Lego
-  if (lowerUrl.includes('lego') || lowerTitle.includes('lego')) {
-    if (!options['État']) {
-      options['État'] = ['Neuf sous scellé', 'Complet avec boîte', 'Occasion'];
-    }
-  }
-
-  return options;
-}
-
-/**
  * Dedicated LEGO set extractor querying the official Brickset set database.
- * Lego.com blocks direct bot requests with Cloudflare Turnstile, but every Lego URL
- * contains the set number (e.g. millennium-falcon-75192 -> 75192).
  */
 async function scrapeLego(url: string): Promise<ScrapedProduct | null> {
   const setMatch = url.match(/(?:product\/[a-z0-9_-]*-|product\/|sets\/)(\d{4,6})/i);
@@ -577,71 +274,61 @@ async function scrapeLego(url: string): Promise<ScrapedProduct | null> {
     const res = await fetch(`https://brickset.com/sets/${setNumber}-1`, {
       headers: {
         'User-Agent':
-          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
       },
     });
     if (!res.ok) return null;
     const html = await res.text();
-    const rawTitle = html.match(/<h1>([^<]+)<\/h1>/)?.[1]?.trim() || '';
-    const img = html.match(/property=["']og:image["'] content=["']([^"']+)["']/i)?.[1] || '';
-    const rrpMatch = html.match(/<dt>RRP<\/dt>\s*<dd>([^<]+)<\/dd>/i);
-    let price: number | null = null;
-    if (rrpMatch && rrpMatch[1]) {
-      const euroMatch = rrpMatch[1].match(/€\s*([0-9.]+)/) || rrpMatch[1].match(/([0-9.]+)\s*€/);
-      if (euroMatch) {
-        price = parseFloat(euroMatch[1]);
-      } else {
-        const anyNum = rrpMatch[1].match(/[0-9.]+/);
-        if (anyNum) price = parseFloat(anyNum[0]);
-      }
-    }
+    const $ = cheerio.load(html);
+
+    const rawTitle = $('h1').first().text().trim();
+    const img = $('meta[property="og:image"]').attr('content') || '';
+    const rrpText = $('dt:contains("RRP")').next('dd').text() || '';
+    const price = parsePrice(rrpText);
 
     const images: string[] = [];
     if (img) images.push(img);
-    const additionalMatches = [...html.matchAll(/class=["'][^"']*highslide[^"']*["'] href=["']([^"']+\.jpg)["']/gi)];
-    for (const m of additionalMatches) {
-      if (!images.includes(m[1])) images.push(m[1]);
-    }
+    $('a.highslide').each((_, el) => {
+      const h = $(el).attr('href');
+      if (h && !images.includes(h)) images.push(h);
+    });
 
     if (rawTitle) {
       return {
         title: rawTitle,
-        image: img,
-        images: images.slice(0, 10),
+        image: images[0] || '',
+        images,
         price,
         options: `Set #${setNumber}`,
-        availableOptions: {
-          'État': ['Neuf sous scellé', 'Complet avec boîte', 'Occasion'],
-        },
+        availableOptions: {},
       };
     }
   } catch {
-    // fallback to generic scraper
+    // fallback
   }
   return null;
 }
 
 /**
  * Dedicated Displate metal poster extractor using __NEXT_DATA__.
- * Provides high-resolution artwork, clean title with artist name,
- * and localized option chips for Sizes, Finishes, and Frames.
  */
 async function scrapeDisplate(url: string): Promise<ScrapedProduct | null> {
   try {
     const res = await fetch(url, {
       headers: {
         'User-Agent':
-          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
         Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
         'Accept-Language': 'fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7',
       },
     });
     if (!res.ok) return null;
     const html = await res.text();
-    const nextDataMatch = html.match(/<script\b[^>]*id=["']__NEXT_DATA__["'][^>]*>([\s\S]*?)<\/script>/i);
-    if (!nextDataMatch) return null;
+    const $ = cheerio.load(html);
+    const nextDataText = $('#__NEXT_DATA__').text();
+    if (!nextDataText) return null;
 
-    const nextData = JSON.parse(nextDataMatch[1]);
+    const nextData = JSON.parse(nextDataText);
     const pageProps = nextData.props?.pageProps;
     if (!pageProps) return null;
 
@@ -700,12 +387,9 @@ async function scrapeDisplate(url: string): Promise<ScrapedProduct | null> {
     const qFrame = pUrl.searchParams.get('frame');
 
     const selectedList: string[] = [];
-    const curSize = qSize || sv.size || sv.selectedProductSize || 'M';
-    if (curSize) selectedList.push(`Taille: ${sizeMap[curSize] || curSize}`);
-    const curType = qType || sv.type || 'matte';
-    if (curType) selectedList.push(`Finition: ${typeMap[curType] || curType}`);
-    const curFrame = qFrame || sv.currentVariant?.frame || sv.frame || 'none';
-    if (curFrame) selectedList.push(`Cadre: ${frameMap[curFrame] || curFrame}`);
+    if (qSize && sizeMap[qSize]) selectedList.push(`Taille: ${sizeMap[qSize]}`);
+    if (qType && typeMap[qType]) selectedList.push(`Finition: ${typeMap[qType]}`);
+    if (qFrame && frameMap[qFrame]) selectedList.push(`Cadre: ${frameMap[qFrame]}`);
 
     return {
       title: cleanTitle(title),
@@ -721,157 +405,136 @@ async function scrapeDisplate(url: string): Promise<ScrapedProduct | null> {
 }
 
 /**
- * Generic Next.js (__NEXT_DATA__) extractor for Next.js e-commerce sites
- * (including BackMarket, Target, Nike, headless Shopify, etc.)
- */
-function extractNextData(html: string): {
-  title?: string;
-  images?: string[];
-  price?: number | null;
-  availableOptions?: Record<string, string[]>;
-  options?: string;
-} | null {
-  const nextDataMatch = html.match(/<script\b[^>]*id=["']__NEXT_DATA__["'][^>]*>([\s\S]*?)<\/script>/i);
-  if (!nextDataMatch) return null;
-  try {
-    const nextData = JSON.parse(nextDataMatch[1]);
-    const pageProps = nextData.props?.pageProps;
-    if (!pageProps || typeof pageProps !== 'object') return null;
-
-    const candidateProduct =
-      pageProps.product ||
-      pageProps.pdpGeneral?.product ||
-      pageProps.initialState?.product ||
-      pageProps.data?.product ||
-      pageProps.item ||
-      pageProps.listing;
-
-    if (candidateProduct && typeof candidateProduct === 'object') {
-      const title = candidateProduct.title || candidateProduct.name || '';
-      const price = parsePrice(
-        candidateProduct.price ||
-          candidateProduct.currentPrice ||
-          candidateProduct.offers?.price ||
-          candidateProduct.price?.amount
-      );
-      const images: string[] = [];
-      if (candidateProduct.image) images.push(candidateProduct.image);
-      if (Array.isArray(candidateProduct.images)) {
-        candidateProduct.images.forEach((img: any) => {
-          const u = typeof img === 'string' ? img : img?.url || img?.src;
-          if (u && !images.includes(u)) images.push(u);
-        });
-      }
-
-      const availableOptions: Record<string, string[]> = {};
-      const variants = candidateProduct.variants || candidateProduct.options || [];
-      if (Array.isArray(variants)) {
-        for (const v of variants) {
-          if (!v) continue;
-          if (v.name && Array.isArray(v.values)) {
-            const dim = translateDimension(v.name);
-            const vals = v.values
-              .map((val: any) => String(val.name || val.value || val.label || val))
-              .filter(Boolean);
-            if (vals.length > 0) availableOptions[dim] = vals;
-          }
-        }
-      }
-
-      return {
-        title,
-        images,
-        price,
-        availableOptions,
-        options: '',
-      };
-    }
-  } catch {
-    // ignore
-  }
-  return null;
-}
-
-/**
- * Dedicated Shopify API extractor.
- * Millions of e-commerce sites (including Maxesport, apparel, gaming brands) run on Shopify
- * and expose their entire catalog cleanly via `/products/{handle}.json`.
+ * Dedicated Shopify API extractor preserving localized subpaths (e.g. /fr/products/...).
  */
 async function scrapeShopify(url: string): Promise<ScrapedProduct | null> {
   try {
     const parsedUrl = new URL(url);
-    const productMatch = parsedUrl.pathname.match(/\/products\/([a-zA-Z0-9_-]+)/);
-    if (!productMatch) return null;
-    const handle = productMatch[1];
-    const jsonUrl = `${parsedUrl.origin}/products/${handle}.json`;
+    const productPathMatch = parsedUrl.pathname.match(/(.*\/products\/[a-zA-Z0-9_-]+)/);
+    if (!productPathMatch) return null;
 
-    const res = await fetch(jsonUrl, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-        Accept: 'application/json',
-      },
-    });
+    const candidateUrls = [
+      `${parsedUrl.origin}${productPathMatch[1]}.json`,
+      `${parsedUrl.origin}/products/${parsedUrl.pathname.split('/').pop()}.json`,
+    ];
 
-    if (!res.ok) return null;
-    const data = await res.json();
+    interface ShopifyVariant {
+      id?: string | number;
+      price?: string | number;
+      title?: string;
+      option1?: string;
+      option2?: string;
+      option3?: string;
+    }
+    interface ShopifyOption {
+      name?: string;
+      values?: string[];
+    }
+    interface ShopifyProduct {
+      title?: string;
+      images?: Array<string | { src?: string }>;
+      image?: { src?: string };
+      variants?: ShopifyVariant[];
+      options?: ShopifyOption[];
+    }
+    interface ShopifyResponse {
+      product?: ShopifyProduct;
+    }
+
+    let data: ShopifyResponse | null = null;
+    for (const jsonUrl of candidateUrls) {
+      try {
+        const res = await fetch(jsonUrl, {
+          headers: {
+            'User-Agent':
+              'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+            Accept: 'application/json',
+          },
+        });
+        if (res.ok) {
+          const json = (await res.json()) as ShopifyResponse;
+          if (json && json.product) {
+            data = json;
+            break;
+          }
+        }
+      } catch {}
+    }
+
     if (!data || !data.product) return null;
 
     const p = data.product;
-    const title = p.title || '';
-    const images: string[] = Array.isArray(p.images)
-      ? p.images.map((img: any) => (typeof img === 'string' ? img : img.src)).filter(Boolean)
-      : (p.image?.src ? [p.image.src] : []);
-    const image = images[0] || '';
+    const title = cleanTitle(p.title || '');
+    const images: string[] = [];
+    if (Array.isArray(p.images)) {
+      p.images.forEach((img) => {
+        const src = typeof img === 'string' ? img : img?.src;
+        const u = normalizeImageUrl(src, url);
+        if (u && !images.includes(u)) images.push(u);
+      });
+    } else if (p.image?.src) {
+      const u = normalizeImageUrl(p.image.src, url);
+      if (u) images.push(u);
+    }
 
     let price: number | null = null;
     let selectedVariant = p.variants?.[0];
     const variantIdParam = parsedUrl.searchParams.get('variant');
     if (variantIdParam && Array.isArray(p.variants)) {
-      const match = p.variants.find((v: any) => String(v.id) === variantIdParam);
+      const match = p.variants.find((v) => String(v.id) === variantIdParam);
       if (match) selectedVariant = match;
     }
     if (selectedVariant && selectedVariant.price) {
-      price = parseFloat(selectedVariant.price);
+      price = parsePrice(selectedVariant.price);
     }
 
     const availableOptions: Record<string, string[]> = {};
     const selectedOptionsList: string[] = [];
 
     if (Array.isArray(p.options)) {
-      for (const opt of p.options) {
-        const dimName = translateDimension(opt.name || 'Option');
+      p.options.forEach((opt, idx) => {
+        const dimName = translateDimension(opt.name || `Option ${idx + 1}`);
         if (Array.isArray(opt.values)) {
           const vals = opt.values.map(String).filter((v: string) => v && v !== 'Default Title');
           if (vals.length > 0 && dimName !== 'Title') {
             availableOptions[dimName] = vals;
+            const optKey = `option${idx + 1}` as keyof ShopifyVariant;
+            const selectedVal = selectedVariant?.[optKey];
+            if (selectedVal && selectedVal !== 'Default Title') {
+              selectedOptionsList.push(`${dimName}: ${selectedVal}`);
+            }
           }
         }
-      }
+      });
     }
 
-    // If options is empty but variants exist, extract variant names
     if (Object.keys(availableOptions).length === 0 && Array.isArray(p.variants) && p.variants.length > 1) {
       const varTitles = p.variants
-        .map((v: any) => v.title)
-        .filter((t: any) => t && typeof t === 'string' && t !== 'Default Title');
+        .map((v) => v.title)
+        .filter((t): t is string => Boolean(t && typeof t === 'string' && t !== 'Default Title'));
       if (varTitles.length > 0) {
         availableOptions['Option'] = Array.from(new Set(varTitles));
       }
     }
 
-    if (selectedVariant && selectedVariant.title && selectedVariant.title !== 'Default Title') {
+    if (selectedOptionsList.length === 0 && selectedVariant && selectedVariant.title && selectedVariant.title !== 'Default Title') {
       selectedOptionsList.push(selectedVariant.title);
     }
 
-    const finalOptions = enrichOptions(availableOptions, title, url);
+    // Default pre-fill if any dimension has no selection
+    for (const [dim, vals] of Object.entries(availableOptions)) {
+      if (!selectedOptionsList.some((o) => o.startsWith(`${dim}:`)) && vals.length > 0) {
+        selectedOptionsList.push(`${dim}: ${vals[0]}`);
+      }
+    }
 
     return {
       title,
-      image,
-      images: images.slice(0, 10),
-      price: isNaN(price as number) ? null : price,
+      image: images[0] || '',
+      images,
+      price,
       options: selectedOptionsList.join(', '),
-      availableOptions: finalOptions,
+      availableOptions,
     };
   } catch {
     return null;
@@ -879,9 +542,9 @@ async function scrapeShopify(url: string): Promise<ScrapedProduct | null> {
 }
 
 /**
- * Master multi-platform product URL scraper.
+ * Universal multi-platform product URL scraper.
  * Supports Amazon, Lego, Shopify stores (Maxesport, etc.), Rhinoshield, Fnac, Darty,
- * Boulanger, Cdiscount, AliExpress, Etsy, Apple, and generic Schema.org/OpenGraph stores.
+ * Boulanger, Cdiscount, Sephora, Zara, Nike, Decathlon, and all Schema.org/OpenGraph stores.
  */
 export async function scrapeProductUrl(rawUrl: string): Promise<ScrapedProduct> {
   try {
@@ -901,7 +564,7 @@ export async function scrapeProductUrl(rawUrl: string): Promise<ScrapedProduct> 
       url = `https://${url}`;
     }
 
-    // 1. Specialized Adapter: LEGO (bypasses Cloudflare on lego.com via Brickset)
+    // 1. Specialized Adapter: LEGO
     if (url.includes('lego.com')) {
       const legoResult = await scrapeLego(url);
       if (legoResult) return legoResult;
@@ -919,13 +582,19 @@ export async function scrapeProductUrl(rawUrl: string): Promise<ScrapedProduct> 
       if (shopifyResult) return shopifyResult;
     }
 
-    // 4. HTTP Fetch with Multi-Level Anti-Bot Bypass
-    const defaultHeaders = {
-      'User-Agent':
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0',
+    // 4. Amazon ASIN Check
+    const amazonMatch = url.match(/(?:dp|gp\/product|\/p)\/([A-Z0-9]{10})/i);
+    const amazonAsin = amazonMatch ? amazonMatch[1] : null;
+
+    // 5. HTTP Fetch with Multi-Level Anti-Bot Bypass
+    const isAmazon = url.includes('amazon.');
+    const headers: Record<string, string> = {
+      'User-Agent': isAmazon
+        ? 'facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)'
+        : 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
       Accept:
-        'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-      'Accept-Language': 'fr,fr-FR;q=0.8,en-US;q=0.5,en;q=0.3',
+        'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+      'Accept-Language': 'fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7',
       'Upgrade-Insecure-Requests': '1',
       'Sec-Fetch-Dest': 'document',
       'Sec-Fetch-Mode': 'navigate',
@@ -933,25 +602,34 @@ export async function scrapeProductUrl(rawUrl: string): Promise<ScrapedProduct> 
       'Sec-Fetch-User': '?1',
     };
 
+    // Essential session cookie for bypassing Amazon CloudFront
+    if (isAmazon) {
+      headers['Cookie'] = 'session-id=258-1234567-8901234; i18n-prefs=EUR; sp-cdn="L5Z9:FR"';
+    }
+
     let html = '';
     try {
-      const response = await fetch(url, { headers: defaultHeaders });
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 10000);
+      const response = await fetch(url, { headers, redirect: 'follow', signal: controller.signal });
+      clearTimeout(timeoutId);
       html = await response.text();
 
       const isBotBlocked =
         html.includes('validateCaptcha') ||
         html.includes('Robot Check') ||
-        (url.includes('amazon.') && (html.includes('api-services-support@amazon.com') || response.status === 503));
+        (url.includes('amazon.') && html.includes('api-services-support@amazon.com'));
 
       if (isBotBlocked || !response.ok) {
-        // Fallback with Mobile Safari User-Agent
+        // Fallback with Mobile Safari headers
         const fallbackHeaders = {
           'User-Agent':
             'Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1',
           Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
           'Accept-Language': 'fr-FR,fr;q=0.9',
+          Cookie: headers['Cookie'] || '',
         };
-        const retryRes = await fetch(url, { headers: fallbackHeaders });
+        const retryRes = await fetch(url, { headers: fallbackHeaders, redirect: 'follow' });
         if (retryRes.ok) {
           const retryHtml = await retryRes.text();
           if (!retryHtml.includes('validateCaptcha')) {
@@ -960,41 +638,111 @@ export async function scrapeProductUrl(rawUrl: string): Promise<ScrapedProduct> 
         }
       }
     } catch {
-      // network error: will fall back to slug
+      // network or abort error: will fall back to ASIN / URL slug
     }
+
+    const $ = cheerio.load(html || '');
 
     // --- Title Extraction ---
     let title = '';
 
-    // Amazon #productTitle
-    const amazonTitleMatch = html.match(/id=["']productTitle["'][^>]*>([\s\S]*?)<\/span>/i);
-    if (amazonTitleMatch && amazonTitleMatch[1].trim()) {
-      title = decodeHtmlEntities(amazonTitleMatch[1].trim());
-    }
+    // 1. Amazon #productTitle
+    const amazonTitle = $('#productTitle').text().trim();
+    if (amazonTitle) title = decodeHtmlEntities(amazonTitle);
 
-    const ogTitle = extractMetaContent(html, 'og:title');
-    const twitterTitle = extractMetaContent(html, 'twitter:title');
-    const jsonLd = extractJsonLd(html);
-    const nextData = extractNextData(html);
-
+    // 2. OpenGraph / Twitter title
     if (!title) {
-      if (nextData && nextData.title) {
-        title = cleanTitle(nextData.title);
-      } else if (ogTitle && ogTitle.trim()) {
-        title = cleanTitle(ogTitle);
-      } else if (jsonLd && jsonLd.title) {
-        title = cleanTitle(jsonLd.title);
-      } else if (twitterTitle && twitterTitle.trim()) {
-        title = cleanTitle(twitterTitle);
-      } else {
-        const titleTag = html.match(/<title\b[^>]*>([\s\S]*?)<\/title>/i);
-        if (titleTag && titleTag[1]) {
-          title = cleanTitle(titleTag[1].replace(/<[^>]+>/g, '').trim());
-        }
-      }
+      const ogTitle = $('meta[property="og:title"]').attr('content') || $('meta[name="twitter:title"]').attr('content');
+      if (ogTitle) title = cleanTitle(ogTitle);
     }
 
-    // Safety fallback: extract clean title from URL slug if empty, blocked, or just a domain
+    // 3. Schema.org JSON-LD
+    interface JsonLdProduct {
+      name?: string;
+      headline?: string;
+      image?: unknown;
+      offers?: unknown;
+      hasVariant?: unknown;
+      variants?: unknown;
+      [key: string]: unknown;
+    }
+
+    const getJsonLdProduct = (): JsonLdProduct | null => {
+      let best: JsonLdProduct | null = null;
+      $('script[type="application/ld+json"]').each((_, el) => {
+        try {
+          const parsed = JSON.parse($(el).text().trim()) as unknown;
+          const findProduct = (obj: unknown) => {
+            if (!obj || typeof obj !== 'object') return;
+            const rec = obj as JsonLdProduct;
+            const type = rec['@type'];
+            const isProd =
+              type === 'Product' ||
+              type === 'ProductGroup' ||
+              type === 'ProductModel' ||
+              (Array.isArray(type) && (type.includes('Product') || type.includes('ProductGroup')));
+            if (isProd && (!best || (rec.offers && !best.offers) || (rec.image && !best.image))) {
+              best = rec;
+            }
+            if (rec.mainEntity) findProduct(rec.mainEntity);
+            if (Array.isArray(obj)) obj.forEach(findProduct);
+            if (rec['@graph'] && Array.isArray(rec['@graph'])) rec['@graph'].forEach(findProduct);
+          };
+          findProduct(parsed);
+        } catch {}
+      });
+      return best;
+    };
+
+    const jsonLdProduct = getJsonLdProduct();
+
+    if (!title && jsonLdProduct) {
+      title = cleanTitle(String(jsonLdProduct.name || jsonLdProduct.headline || ''));
+    }
+
+    // 4. Next.js __NEXT_DATA__
+    interface NextDataProduct {
+      title?: string;
+      name?: string;
+      image?: unknown;
+      images?: unknown;
+      price?: unknown;
+      currentPrice?: unknown;
+      offers?: unknown;
+      [key: string]: unknown;
+    }
+
+    const getNextDataProduct = (): NextDataProduct | null => {
+      const nextDataText = $('#__NEXT_DATA__').text();
+      if (!nextDataText) return null;
+      try {
+        const nextData = JSON.parse(nextDataText) as { props?: { pageProps?: Record<string, unknown> } };
+        const pp = nextData.props?.pageProps;
+        const pdpGeneral = pp?.pdpGeneral as Record<string, unknown> | undefined;
+        const dataProp = pp?.data as Record<string, unknown> | undefined;
+        const candidate = (pp?.product || pdpGeneral?.product || dataProp?.product || pp?.item) as NextDataProduct | undefined;
+        return candidate && typeof candidate === 'object' ? candidate : null;
+      } catch {
+        return null;
+      }
+    };
+
+    const nextDataProduct = getNextDataProduct();
+    if (!title && nextDataProduct) {
+      title = cleanTitle(String(nextDataProduct.title || nextDataProduct.name || ''));
+    }
+
+    // 5. DOM H1 or <title>
+    if (!title) {
+      const h1Text = $('h1.product-title, h1.product-name, h1.product__title, h1[itemprop="name"], h1').first().text().trim();
+      if (h1Text) title = cleanTitle(h1Text);
+    }
+    if (!title) {
+      const titleTag = $('title').text().trim();
+      if (titleTag) title = cleanTitle(titleTag);
+    }
+
+    // 6. Safety fallback to URL slug
     const isGenericOrBlockedTitle =
       !title ||
       title.toLowerCase() === 'amazon.fr' ||
@@ -1004,7 +752,6 @@ export async function scrapeProductUrl(rawUrl: string): Promise<ScrapedProduct> 
       title.toLowerCase().includes('access denied') ||
       title.toLowerCase().includes('forbidden') ||
       title.toLowerCase().includes('just a moment') ||
-      title.toLowerCase().includes('attention required') ||
       title.toLowerCase().includes('page introuvable') ||
       title.toLowerCase().includes('404') ||
       title.toLowerCase().includes('protection ultime') ||
@@ -1012,327 +759,507 @@ export async function scrapeProductUrl(rawUrl: string): Promise<ScrapedProduct> 
 
     if (isGenericOrBlockedTitle) {
       const slugTitle = slugToTitle(url);
-      if (slugTitle) {
-        title = slugTitle;
-      }
+      if (slugTitle) title = slugTitle;
     }
 
     // --- Images Extraction ---
     const images: string[] = [];
+    const seenImageKeys = new Set<string>();
     const addUrl = (raw: string | undefined | null) => {
-      if (!raw || typeof raw !== 'string') return;
-      let trimmed = raw.trim();
-      if (!trimmed || trimmed.startsWith('data:') || trimmed.includes('grey-pixel') || trimmed.includes('placeholder')) {
-        return;
-      }
-      try {
-        trimmed = new URL(trimmed, url).href;
-      } catch {
-        // keep if already valid
-      }
-      if (!images.includes(trimmed)) {
-        images.push(trimmed);
+      const norm = normalizeImageUrl(raw, url);
+      if (!norm) return;
+      const amazonImageMatch = norm.match(/\/images\/[IP]\/([A-Za-z0-9+_-]+)\./);
+      const key = amazonImageMatch ? amazonImageMatch[1] : norm.split('?')[0];
+      if (!seenImageKeys.has(key) && !images.includes(norm)) {
+        seenImageKeys.add(key);
+        images.push(norm);
       }
     };
 
-    // Amazon colorImages JSON gallery
-    const amazonJsonStart = html.indexOf("A.$.parseJSON('[");
-    if (amazonJsonStart !== -1) {
-      const amazonJsonEnd = html.indexOf("]')", amazonJsonStart);
-      if (amazonJsonEnd !== -1) {
+    // 1. Amazon ColorImages and Gallery
+    if (url.includes('amazon.')) {
+      let parsedFromColorImages = false;
+      const scriptRegex = /'colorImages':\s*\{\s*'initial':\s*(?:A\.\$\.parseJSON\('((?:\\.|[^'\\])*)'\)|(\[\{.+?\}\]))/;
+      const match = html.match(scriptRegex);
+      if (match) {
+        const rawJson = match[1] ? match[1].replace(/\\'/g, "'").replace(/\\"/g, '"').replace(/\\\\/g, '\\') : match[2];
         try {
-          const raw = html.slice(amazonJsonStart + "A.$.parseJSON('".length, amazonJsonEnd + 1);
-          const unescaped = raw.replace(/\\'/g, "'").replace(/\\\\/g, "\\");
-          const items = JSON.parse(unescaped);
-          if (Array.isArray(items)) {
-            for (const it of items) {
-              const u = it.hiRes || it.large || (it.main && typeof it.main === 'object' ? Object.keys(it.main)[0] : null);
-              addUrl(u);
+          const parsed = JSON.parse(rawJson) as Array<{ hiRes?: string; large?: string; main?: string }>;
+          if (Array.isArray(parsed)) {
+            for (const item of parsed) {
+              addUrl(item.hiRes || item.large || item.main);
             }
+            parsedFromColorImages = images.length > 0;
           }
-        } catch {
-          // ignore
+        } catch {}
+      }
+
+      // If colorImages was not found in the script, fall back to DOM gallery
+      if (!parsedFromColorImages) {
+        addUrl($('#landingImage').attr('data-old-hires'));
+        addUrl($('#landingImage').attr('src'));
+        addUrl($('#imgBlkFront').attr('src'));
+        const dynamicData = $('#landingImage').attr('data-a-dynamic-image');
+        if (dynamicData) {
+          try {
+            const parsed = JSON.parse(decodeHtmlEntities(dynamicData)) as Record<string, unknown>;
+            for (const u of Object.keys(parsed)) addUrl(u);
+          } catch {}
+        }
+
+        // Amazon altImages thumbnails
+        $('#altImages ul li.imageThumbnail img, #altImages ul li.item img').each((_, el) => {
+          addUrl($(el).attr('src'));
+        });
+
+        // Fallback: ONLY if no images were found from the page, use the base ASIN image
+        if (images.length === 0 && amazonAsin) {
+          addUrl(`https://images-na.ssl-images-amazon.com/images/P/${amazonAsin}.01.jpg`);
         }
       }
     }
 
-    // Amazon landingImage / imgBlkFront
-    const landingTag = html.match(/<img(?=[^>]*\bid=["'](?:landingImage|imgBlkFront)["'])[^>]*>/i);
-    if (landingTag) {
-      const hires = landingTag[0].match(/\bdata-old-hires=["']([^"']+)["']/i);
-      const src = landingTag[0].match(/\bsrc=["']([^"']+)["']/i);
-      addUrl(hires ? hires[1] : (src ? src[1] : null));
-    }
-
-    // Amazon data-a-dynamic-image
-    const dynamicMatch = html.match(/data-a-dynamic-image=["']([^"']+)["']/i);
-    if (dynamicMatch) {
-      try {
-        const parsed = JSON.parse(decodeHtmlEntities(dynamicMatch[1]));
-        for (const u of Object.keys(parsed)) {
-          addUrl(u);
+    // 2-6. Schema.org, NextData, OpenGraph, and DOM Gallery images (for non-Amazon sites or fallback)
+    if (!url.includes('amazon.') || images.length === 0) {
+      // 2. Schema.org JSON-LD images
+      if (jsonLdProduct && jsonLdProduct.image) {
+        if (Array.isArray(jsonLdProduct.image)) {
+          jsonLdProduct.image.forEach((img: unknown) => {
+            const u = typeof img === 'string' ? img : (img as { url?: string; contentUrl?: string })?.url || (img as { url?: string; contentUrl?: string })?.contentUrl;
+            addUrl(u);
+          });
+        } else if (typeof jsonLdProduct.image === 'string') {
+          addUrl(jsonLdProduct.image);
+        } else if (typeof jsonLdProduct.image === 'object' && jsonLdProduct.image !== null) {
+          const imgObj = jsonLdProduct.image as { url?: string; contentUrl?: string };
+          addUrl(imgObj.url || imgObj.contentUrl);
         }
-      } catch {
-        // ignore
       }
-    }
 
-    // JSON-LD images (covers Rhinoshield, Boulanger, Darty, LDLC, etc.)
-    if (jsonLd && jsonLd.images) {
-      jsonLd.images.forEach(addUrl);
-    }
+      // 3. Next.js __NEXT_DATA__ images
+      if (nextDataProduct) {
+        if (typeof nextDataProduct.image === 'string') addUrl(nextDataProduct.image);
+        if (Array.isArray(nextDataProduct.images)) {
+          nextDataProduct.images.forEach((img: unknown) => {
+            const u = typeof img === 'string' ? img : (img as { url?: string; src?: string })?.url || (img as { url?: string; src?: string })?.src;
+            addUrl(u);
+          });
+        }
+      }
 
-    // Next.js __NEXT_DATA__ images
-    if (nextData && nextData.images) {
-      nextData.images.forEach(addUrl);
-    }
+      // 4. OpenGraph & Twitter images
+      addUrl($('meta[property="og:image"]').attr('content'));
+      addUrl($('meta[property="og:image:secure_url"]').attr('content'));
+      addUrl($('meta[name="twitter:image"]').attr('content'));
+      addUrl($('meta[name="twitter:image:src"]').attr('content'));
+      addUrl($('link[rel="image_src"]').attr('href'));
 
-    // OpenGraph and Twitter images
-    addUrl(extractMetaContent(html, 'og:image'));
-    addUrl(extractMetaContent(html, 'og:image:secure_url'));
-    addUrl(extractMetaContent(html, 'twitter:image'));
-    addUrl(extractMetaContent(html, 'twitter:image:src'));
+      // 5. DOM Gallery images (from product gallery containers only)
+      $(
+        '.product-gallery img, .product-media img, .product-images img, .pdp-images img, [data-gallery] img, .gallery img, .product-single__media img, .woocommerce-product-gallery img'
+      ).each((_, el) => {
+        const src =
+          $(el).attr('data-zoom-image') ||
+          $(el).attr('data-large-src') ||
+          $(el).attr('data-high-res-src') ||
+          $(el).attr('data-src') ||
+          $(el).attr('src');
+        addUrl(src);
+      });
 
-    // HTML link image_src
-    const linkMatch = html.match(/<link(?=[^>]*\brel=["']image_src["'])[^>]*>/i);
-    if (linkMatch) {
-      const href = linkMatch[0].match(/\bhref=["']([^"']+)["']/i);
-      if (href) addUrl(href[1]);
+      // 6. Parse srcset for high-res images
+      $('picture source[srcset], img[srcset]').each((_, el) => {
+        const srcset = $(el).attr('srcset');
+        if (srcset) {
+          const parts = srcset.split(',').map((p) => p.trim());
+          const last = parts[parts.length - 1];
+          if (last) {
+            const u = last.split(' ')[0];
+            addUrl(u);
+          }
+        }
+      });
     }
 
     // --- Price Extraction ---
     let price: number | null = null;
 
-    // Amazon price
-    const wholeMatch = html.match(/<span class=["'][^"']*a-price-whole[^"']*["']>([\s\S]*?)<\/span>/i);
-    const fractionMatch = html.match(/<span class=["'][^"']*a-price-fraction[^"']*["']>([\s\S]*?)<\/span>/i);
-    if (wholeMatch && wholeMatch[1]) {
-      const whole = wholeMatch[1].replace(/<[^>]+>/g, '').replace(/[^0-9]/g, '');
-      const fraction = fractionMatch && fractionMatch[1] ? fractionMatch[1].replace(/<[^>]+>/g, '').replace(/[^0-9]/g, '') : '';
-      if (whole) {
-        price = parseFloat(fraction ? `${whole}.${fraction}` : whole);
+    // 1. Amazon specific price
+    const amazonPriceText =
+      $('#corePriceDisplay_desktop_feature_div .a-price:not(.a-text-strike) .a-offscreen').first().text().trim() ||
+      $('#corePrice_feature_div .a-price:not(.a-text-strike) .a-offscreen').first().text().trim() ||
+      $('#apex_desktop .a-price:not(.a-text-strike) .a-offscreen').first().text().trim() ||
+      $('#booksHeaderSection .a-price:not(.a-text-strike) .a-offscreen').first().text().trim() ||
+      $('.a-price:not(.a-text-strike) .a-offscreen').first().text().trim();
+
+    if (amazonPriceText) {
+      price = parsePrice(amazonPriceText);
+    }
+
+    // 2. Schema.org JSON-LD Price
+    if (price === null && jsonLdProduct && jsonLdProduct.offers) {
+      const off = jsonLdProduct.offers as Array<Record<string, unknown>> | Record<string, unknown> | undefined;
+      if (Array.isArray(off)) {
+        for (const o of off) {
+          const spec = o.priceSpecification as Record<string, unknown> | undefined;
+          const p = parsePrice((o.price ?? o.lowPrice ?? o.highPrice ?? spec?.price) as string | number | null);
+          if (p !== null) {
+            price = p;
+            break;
+          }
+        }
+      } else if (typeof off === 'object' && off !== null) {
+        const spec = off.priceSpecification as Record<string, unknown> | undefined;
+        price = parsePrice((off.price ?? off.lowPrice ?? off.highPrice ?? spec?.price) as string | number | null);
       }
     }
 
-    if (price === null) {
-      const offscreenMatch = html.match(/<span class=["'][^"']*a-offscreen[^"']*["']>([\s\S]*?)<\/span>/i);
-      if (offscreenMatch && offscreenMatch[1]) {
-        price = parsePrice(offscreenMatch[1].replace(/<[^>]+>/g, ''));
-      }
+    // 3. Next.js __NEXT_DATA__ price
+    if (price === null && nextDataProduct) {
+      const off = nextDataProduct.offers as Record<string, unknown> | undefined;
+      const priceObj = nextDataProduct.price as Record<string, unknown> | undefined;
+      price = parsePrice(
+        (nextDataProduct.price ??
+          nextDataProduct.currentPrice ??
+          off?.price ??
+          priceObj?.amount) as string | number | null
+      );
     }
 
-    // Next.js pageProps price
-    if (price === null && nextData && nextData.price !== null && nextData.price !== undefined) {
-      price = nextData.price;
-    }
-
-    // Schema.org JSON-LD Price (e.g. Rhinoshield 62.99, LDLC, Cdiscount, etc.)
-    if (price === null && jsonLd && jsonLd.price !== null) {
-      price = jsonLd.price;
-    }
-
-    // Meta tags: product:price:amount or og:price:amount
+    // 4. Meta tags: product:price:amount or og:price:amount
     if (price === null) {
       const metaPrice =
-        extractMetaContent(html, 'product:price:amount') ||
-        extractMetaContent(html, 'og:price:amount') ||
-        extractMetaContent(html, 'price');
+        $('meta[property="product:price:amount"]').attr('content') ||
+        $('meta[property="og:price:amount"]').attr('content') ||
+        $('meta[name="twitter:data1"]').attr('content') ||
+        $('meta[itemprop="price"]').attr('content');
       if (metaPrice) price = parsePrice(metaPrice);
     }
 
-    // Microdata itemprop="price"
+    // 5. Microdata itemprop="price"
     if (price === null) {
-      const microMatch = html.match(/itemprop=["']price["'][^>]*content=["']([^"']+)["']/i);
-      if (microMatch && microMatch[1]) {
-        price = parsePrice(microMatch[1]);
-      }
+      const microVal = $('[itemprop="price"]').attr('content') || $('[itemprop="price"]').text();
+      if (microVal) price = parsePrice(microVal);
     }
 
-    // HTML Currency patterns (€, $, £)
+    // 6. Common e-commerce DOM price selectors
     if (price === null) {
-      const cleanedHtml = html
-        .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, ' ')
-        .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, ' ')
-        .replace(/&(?:euro|#8364|#x20ac);/gi, '€')
-        .replace(/&(?:nbsp|#160|#xa0);|\u00A0/gi, ' ');
+      const selectorPrice = $(
+        '.price--current, .current-price, .product__price, .product-price, .price-item--sale, .product-price__current, [data-product-price], [data-price], [data-test="product-price"], .price-sales, .sales-price, .special-price'
+      )
+        .first()
+        .text();
+      if (selectorPrice) price = parsePrice(selectorPrice);
+    }
 
-      const euroRegex = /(?:€\s*(\d+(?:[\s.,]\d{3})*(?:[.,]\d{1,2})?)|(\d+(?:[\s.,]\d{3})*(?:[.,]\d{1,2})?)\s*€)/i;
-      const match = cleanedHtml.match(euroRegex);
-      if (match) {
-        price = parsePrice(match[1] || match[2] || '');
+    // 7. General text regex fallback for currency patterns
+    if (price === null && html) {
+      const cleanedText = html.replace(/\u00A0|&nbsp;/g, ' ');
+      const currencyMatches = [...cleanedText.matchAll(/([0-9]{1,4}(?:[.,][0-9]{2})?)\s*€/g)];
+      if (currencyMatches.length > 0) {
+        for (const m of currencyMatches) {
+          const p = parsePrice(m[0]);
+          if (p !== null && p > 1 && p < 10000) {
+            price = p;
+            break;
+          }
+        }
       }
     }
 
     // --- Options & Variants Extraction ---
-    const availableOptions: Record<string, string[]> = {
-      ...(jsonLd?.availableOptions || {}),
-      ...(nextData?.availableOptions || {}),
-    };
+    const availableOptions: Record<string, string[]> = {};
     const selectedOptionsList: string[] = [];
-    if (jsonLd?.options) selectedOptionsList.push(jsonLd.options);
-    if (nextData?.options) selectedOptionsList.push(nextData.options);
 
-    // Check URL parameters for selected model / device / color / size
+    const addSelected = (dim: string, val: string) => {
+      const cleanDim = translateDimension(dim);
+      const cleanVal = (val || '').trim();
+      if (cleanDim && cleanVal && !selectedOptionsList.some((o) => o.startsWith(`${cleanDim}:`))) {
+        selectedOptionsList.push(`${cleanDim}: ${cleanVal}`);
+      }
+    };
+
+    const addAvailable = (dim: string, vals: string[]) => {
+      const cleanDim = translateDimension(dim);
+      if (!cleanDim || !vals || vals.length === 0) return;
+      const cleanVals = vals.map((v) => String(v).trim()).filter(Boolean);
+      if (cleanVals.length > 0) {
+        const existing = availableOptions[cleanDim] || [];
+        availableOptions[cleanDim] = Array.from(new Set([...existing, ...cleanVals]));
+      }
+    };
+
+    // 1. Amazon variation values & dimensionValuesDisplayData
+    if (url.includes('amazon.')) {
+      const varMatch = html.match(/"variationValues"\s*:\s*(\{[^;]+?\})\s*,\s*"\w+"/);
+      if (varMatch) {
+        try {
+          const varObj = JSON.parse(varMatch[1]) as Record<string, string[]>;
+          for (const [rawDim, vals] of Object.entries(varObj)) {
+            if (Array.isArray(vals)) addAvailable(rawDim, vals);
+          }
+        } catch {}
+      }
+
+      const dimMatch = html.match(/"dimensionValuesDisplayData"\s*:\s*(\{[^;]+?\})\s*,\s*"\w+"/);
+      if (dimMatch && amazonAsin) {
+        try {
+          const dimObj = JSON.parse(dimMatch[1]) as Record<string, string[]>;
+          const currentVals = dimObj[amazonAsin];
+          if (Array.isArray(currentVals)) {
+            currentVals.forEach((val, i) => {
+              const dims = Object.keys(availableOptions);
+              const dimName = dims[i] || 'Couleur';
+              addSelected(dimName, val);
+            });
+          }
+        } catch {}
+      }
+    }
+
+    // 2. Swatches (Amazon, etc.)
+    $('div[id^="variation_"]').each((_, el) => {
+      const rawId = $(el).attr('id') || '';
+      const dim = translateDimension(rawId.replace(/^variation_/, '').replace(/_name$/, '').replace(/_/g, ' '));
+      const selection = $(el).find('.selection').text().trim();
+      if (selection) addSelected(dim, selection);
+
+      const values: string[] = [];
+      $(el)
+        .find('li[title], img[alt], button')
+        .each((_, item) => {
+          const val = $(item).attr('title') || $(item).attr('alt') || $(item).text();
+          const clean = (val || '').replace(/^(?:Cliquez pour sélectionner|Click to select)\s*/i, '').trim();
+          if (clean && !values.includes(clean) && clean.length < 40) values.push(clean);
+        });
+      if (values.length > 0) addAvailable(dim, values);
+    });
+
+    // 3. Technical specifications table (Couleur, Taille, Résolution, Capacité, Pointure)
+    $('#productDetails_techSpec_section_1 tr, #technicalSpecifications_section_1 tr, .prodDetTable tr, table.spec-table tr').each((_, tr) => {
+      const key = $(tr).find('th, td:first-child').text().trim().toLowerCase();
+      const val = $(tr).find('td:last-child').text().trim();
+      if (!key || !val || val.length > 60) return;
+
+      if (/couleur|color/i.test(key)) {
+        addSelected('Couleur', val);
+        addAvailable('Couleur', [val]);
+      } else if (/taille|dimensions?\s+du\s+produit/i.test(key) && !/cm|mm/i.test(val)) {
+        addSelected('Taille', val);
+        addAvailable('Taille', [val]);
+      } else if (/résolution|resolution/i.test(key)) {
+        addSelected('Résolution', val);
+        addAvailable('Résolution', [val]);
+      } else if (/stockage|capacit|memory|storage|disque dur/i.test(key)) {
+        addSelected('Capacité', val);
+        addAvailable('Capacité', [val]);
+      } else if (/pointure/i.test(key)) {
+        addSelected('Pointure', val);
+        addAvailable('Pointure', [val]);
+      }
+    });
+
+    // 4. JSON-LD variants
+    if (jsonLdProduct) {
+      const variants = (jsonLdProduct.hasVariant || jsonLdProduct.variants) as Array<Record<string, unknown>> | undefined;
+      if (Array.isArray(variants)) {
+        for (const v of variants) {
+          if (!v || typeof v !== 'object') continue;
+          if (v.color) addAvailable('Couleur', [String(v.color).trim()]);
+          if (v.size) addAvailable('Taille', [String(v.size).trim()]);
+          if (v.material) addAvailable('Matière', [String(v.material).trim()]);
+          if (v.pattern) addAvailable('Modèle', [String(v.pattern).trim()]);
+          if (v.image) {
+            const u = typeof v.image === 'string' ? v.image : (v.image as { url?: string })?.url;
+            addUrl(u);
+          }
+        }
+      }
+    }
+
+    // 5. URL query parameters
     try {
       const pUrl = new URL(url);
-      const deviceParam = pUrl.searchParams.get('device') || pUrl.searchParams.get('model');
-      if (deviceParam) {
-        const cleanDev = deviceParam.replace(/-/g, ' ').replace(/\b\w/g, (l) => l.toUpperCase());
-        selectedOptionsList.push(`Modèle: ${cleanDev}`);
-        availableOptions['Modèle'] = [cleanDev];
+      const dev = pUrl.searchParams.get('device') || pUrl.searchParams.get('model');
+      if (dev) {
+        const cleanDev = dev.replace(/-/g, ' ').replace(/\b\w/g, (l) => l.toUpperCase());
+        addSelected('Modèle', cleanDev);
+        addAvailable('Modèle', [cleanDev]);
       }
-      const colorParam = pUrl.searchParams.get('color') || pUrl.searchParams.get('couleur');
-      if (colorParam) {
-        const cleanCol = colorParam.replace(/-/g, ' ').replace(/\b\w/g, (l) => l.toUpperCase());
-        selectedOptionsList.push(`Couleur: ${cleanCol}`);
-        availableOptions['Couleur'] = [cleanCol];
+      const col = pUrl.searchParams.get('color') || pUrl.searchParams.get('couleur');
+      if (col) {
+        const cleanCol = col.replace(/-/g, ' ').replace(/\b\w/g, (l) => l.toUpperCase());
+        addSelected('Couleur', cleanCol);
+        addAvailable('Couleur', [cleanCol]);
       }
-      const sizeParam = pUrl.searchParams.get('size') || pUrl.searchParams.get('taille');
-      if (sizeParam) {
-        const cleanSize = sizeParam.replace(/-/g, ' ').toUpperCase();
-        selectedOptionsList.push(`Taille: ${cleanSize}`);
-        availableOptions['Taille'] = [cleanSize];
+      const sz = pUrl.searchParams.get('size') || pUrl.searchParams.get('taille');
+      if (sz) {
+        const cleanSz = sz.replace(/-/g, ' ').toUpperCase();
+        addSelected('Taille', cleanSz);
+        addAvailable('Taille', [cleanSz]);
       }
-    } catch {
-      // ignore
+    } catch {}
+
+    // 6. Regex in title & URL for resolution, capacity, color, size
+    const fullText = `${title} ${url}`;
+    const colMatch = fullText.match(/\b(?:Couleur|Color)\s*[:\s-]\s*([a-zA-ZÀ-ÿ\s-]+?)(?:[;,|–\.]|\s+-\s+|$|\s+(?:avec|pour|de|et)\b)/i);
+    if (colMatch && colMatch[1].trim().length < 25) {
+      addSelected('Couleur', colMatch[1].trim());
+      addAvailable('Couleur', [colMatch[1].trim()]);
+    }
+    const szMatch = fullText.match(/\b(?:Taille|Size)\s*[:\s-]\s*([a-zA-Z0-9À-ÿ\s/]+?)(?:[;,|–\.]|\s+-\s+|$|\s+(?:avec|pour|de|et)\b)/i);
+    if (szMatch && szMatch[1].trim().length < 20) {
+      addSelected('Taille', szMatch[1].trim());
+      addAvailable('Taille', [szMatch[1].trim()]);
+    }
+    const resMatch = fullText.match(/\b(4K\s*UHD|4K|1440p|1080p|QHD|WQHD|FHD|2160p|2560\s*x\s*1440|3840\s*x\s*2160|1920\s*x\s*1080)\b/i);
+    if (resMatch && resMatch[1]) {
+      addSelected('Résolution', resMatch[1].toUpperCase());
+      addAvailable('Résolution', [resMatch[1].toUpperCase()]);
+    }
+    const capMatch = fullText.match(/\b(64\s*Go|128\s*Go|256\s*Go|512\s*Go|1\s*To|2\s*To|64\s*GB|128\s*GB|256\s*GB|512\s*GB|1\s*TB|2\s*TB)\b/i);
+    if (capMatch && capMatch[1]) {
+      addSelected('Capacité', capMatch[1]);
+      addAvailable('Capacité', [capMatch[1]]);
     }
 
-    // Amazon variationValues JSON (using robust balanced block parser)
-    const varValues = extractJsonBlock(html, '"variationValues"');
-    const selectedVar = extractJsonBlock(html, '"selectedVariationValues"') || {};
-    if (varValues && typeof varValues === 'object') {
-      const friendlyNames: Record<string, string> = {
-        size_name: 'Taille',
-        color_name: 'Couleur',
-        style_name: 'Style',
-        pattern_name: 'Modèle',
-        flavor_name: 'Saveur',
-        edition_name: 'Édition',
-        material_type: 'Matière',
-        capacity_name: 'Capacité',
-      };
+    // 7. HTML Select elements
+    $('select').each((_, el) => {
+      if (
+        $(el).closest(
+          'header, nav, footer, #navbar, #nav-belt, #nav-main, form[action*="/search"], .search, .footer, .sidebar, #nav-search-dropdown-card'
+        ).length > 0
+      ) {
+        return;
+      }
+      const nameOrId = ($(el).attr('name') || $(el).attr('id') || $(el).attr('aria-label') || '').toLowerCase();
+      if (
+        /quantity|quantite|\bqty\b|sort|rating|country|pays|currency|devise|lang|shipping|billing|search|category|categorie|offlinestore|feedback/i.test(
+          nameOrId
+        )
+      ) {
+        return;
+      }
 
-      for (const [key, values] of Object.entries(varValues)) {
-        if (!Array.isArray(values) || values.length === 0) continue;
-        const label = friendlyNames[key] || translateDimension(key.replace(/_/g, ' '));
-        const cleanValues = values.map((v) => decodeHtmlEntities(String(v)).trim()).filter(Boolean);
-        if (cleanValues.length > 0) {
-          availableOptions[label] = cleanValues;
-          const selectedIdx = (selectedVar as any)[key];
-          if (typeof selectedIdx === 'number' && cleanValues[selectedIdx]) {
-            if (!selectedOptionsList.some((o) => o.startsWith(label))) {
-              selectedOptionsList.push(`${label}: ${cleanValues[selectedIdx]}`);
+      let dimName = '';
+      if (/color|couleur/i.test(nameOrId)) dimName = 'Couleur';
+      else if (/pointure/i.test(nameOrId)) dimName = 'Pointure';
+      else if (/size|taille/i.test(nameOrId)) dimName = 'Taille';
+      else if (/capacit|stockage|storage|memory/i.test(nameOrId)) dimName = 'Capacité';
+      else if (/version/i.test(nameOrId)) dimName = 'Version';
+      else if (/model|modèle/i.test(nameOrId)) dimName = 'Modèle';
+      else if (/finish|finition/i.test(nameOrId)) dimName = 'Finition';
+      else if (/style/i.test(nameOrId)) dimName = 'Style';
+      else if (/material|matiere|matière/i.test(nameOrId)) dimName = 'Matière';
+      else if (/edition|édition/i.test(nameOrId)) dimName = 'Édition';
+      else {
+        const labelText = $(el)
+          .closest('label, .form-group, .product-form__input, .variant-input')
+          .find('label, legend, span')
+          .first()
+          .text()
+          .trim();
+        if (labelText && labelText.length < 30) {
+          dimName = translateDimension(labelText);
+        } else if (/variant|option/i.test(nameOrId)) {
+          dimName = 'Option';
+        }
+      }
+
+      if (!dimName) return;
+
+      const vals: string[] = [];
+      let selectedText = '';
+      $(el)
+        .find('option')
+        .each((_, opt) => {
+          const txt = $(opt).text().trim();
+          const val = $(opt).attr('value') || '';
+          if (
+            txt &&
+            !/^(choisir|select|sélectionner|veuillez|--|\.\.\.|none|aucun|toutes nos)/i.test(txt) &&
+            !/^(choisir|select|sélectionner|veuillez|--|\.\.\.|none|aucun)/i.test(val) &&
+            txt.length < 50
+          ) {
+            if (!vals.includes(txt)) vals.push(txt);
+            if ($(opt).is(':selected') && !selectedText) {
+              selectedText = txt;
             }
           }
+        });
+
+      if (vals.length > 0 && !vals.every((v) => /^\d+$/.test(v.trim()))) {
+        addAvailable(dimName, vals);
+        if (selectedText) {
+          addSelected(dimName, selectedText);
         }
       }
-    }
+    });
 
-    // AliExpress skuPropertyList
-    const skuProps = extractJsonBlock(html, '"skuPropertyList"');
-    if (Array.isArray(skuProps)) {
-      for (const prop of skuProps) {
-        const dim = translateDimension(prop.skuPropertyName || 'Option');
-        if (Array.isArray(prop.skuPropertyValues)) {
-          const vals = prop.skuPropertyValues
-            .map((v: any) => v.propertyValueDisplayName || v.skuPropertyDisplayName || v.propertyValueName)
-            .filter(Boolean);
-          if (vals.length > 0) {
-            const existing = availableOptions[dim] || [];
-            availableOptions[dim] = Array.from(new Set([...existing, ...vals]));
+    // 8. Radio inputs & fieldsets
+    $('fieldset').each((_, el) => {
+      if (
+        $(el).closest(
+          'header, nav, footer, #navbar, form[action*="/search"], .search, .footer, .sidebar, #lower-price-feedback, #pricing-feedback'
+        ).length > 0
+      ) {
+        return;
+      }
+      const legend = $(el).find('legend').text().trim();
+      if (
+        legend &&
+        legend.length < 35 &&
+        !/filtr|sort|trier|livraison|shipping|paiement|avis|rating|availab|prix|signal|offline|online/i.test(legend)
+      ) {
+        const dim = translateDimension(legend);
+        const vals: string[] = [];
+        let checkedVal = '';
+        $(el)
+          .find('input[type="radio"], button, [data-value]')
+          .each((_, inp) => {
+            const v = $(inp).attr('value') || $(inp).attr('data-value') || $(inp).text().trim();
+            if (
+              v &&
+              !vals.includes(v) &&
+              v.length < 40 &&
+              !/^\d+$/.test(v.trim()) &&
+              !/online|offline/i.test(v)
+            ) {
+              vals.push(v);
+              if (
+                ($(inp).is(':checked') ||
+                  $(inp).attr('aria-checked') === 'true' ||
+                  $(inp).hasClass('selected') ||
+                  $(inp).hasClass('active')) &&
+                !checkedVal
+              ) {
+                checkedVal = v;
+              }
+            }
+          });
+        if (vals.length > 0) {
+          addAvailable(dim, vals);
+          if (checkedVal) {
+            addSelected(dim, checkedVal);
           }
         }
       }
-    }
+    });
 
-    // Amazon DOM variation blocks (#variation_color_name, #variation_size_name, etc.)
-    const amazonVarDivs = [
-      ...html.matchAll(/<div\b(?=[^>]*\bid=["']variation_([a-zA-Z0-9_]+)["'])[^>]*>([\s\S]*?)<\/ul>/gi),
-    ];
-    for (const match of amazonVarDivs) {
-      const rawDim = match[1];
-      const dim = translateDimension(rawDim.replace(/_name$/, '').replace(/_/g, ' '));
-      const block = match[2];
-
-      const selMatch = block.match(/<span class=["'][^"']*selection[^"']*["']>([\s\S]*?)<\/span>/i);
-      if (selMatch && selMatch[1].trim()) {
-        const selVal = decodeHtmlEntities(selMatch[1].replace(/<[^>]+>/g, '').trim());
-        if (selVal && !selectedOptionsList.some((o) => o.startsWith(dim))) {
-          selectedOptionsList.push(`${dim}: ${selVal}`);
-        }
-      }
-
-      const swatchItems = [
-        ...block.matchAll(/\btitle=["'](?:Cliquez pour sélectionner\s*|Click to select\s*)?([^"']+)["']/gi),
-      ];
-      const swatchVals = swatchItems
-        .map((m) =>
-          decodeHtmlEntities(m[1].replace(/^(?:Taille|Couleur|Taille\s*:|Couleur\s*:)\s*/i, '').trim())
-        )
-        .filter(Boolean);
-      if (swatchVals.length > 0) {
-        const existing = availableOptions[dim] || [];
-        availableOptions[dim] = Array.from(new Set([...existing, ...swatchVals]));
+    // 9. If any dimension in availableOptions has no selected choice yet, pre-fill with the first available choice
+    for (const [dim, vals] of Object.entries(availableOptions)) {
+      if (!selectedOptionsList.some((o) => o.startsWith(`${dim}:`)) && vals.length > 0) {
+        addSelected(dim, vals[0]);
       }
     }
-
-    // HTML Select elements (color, size, etc.)
-    const selectMatches = [
-      ...html.matchAll(
-        /<select\b(?=[^>]*\b(?:name|id)=["']([^"']*(?:color|couleur|size|taille|version|modele|style|dimension|pointure|stockage|capacite)[^"']*)["'])[^>]*>([\s\S]*?)<\/select>/gi
-      ),
-    ];
-    for (const sm of selectMatches) {
-      const attr = sm[1].toLowerCase();
-      let dimName = 'Option';
-      if (attr.includes('color') || attr.includes('couleur')) dimName = 'Couleur';
-      else if (attr.includes('pointure')) dimName = 'Pointure';
-      else if (attr.includes('size') || attr.includes('taille')) dimName = 'Taille';
-      else if (attr.includes('capacite') || attr.includes('stockage')) dimName = 'Capacité';
-      else if (attr.includes('version')) dimName = 'Version';
-      else if (attr.includes('modele')) dimName = 'Modèle';
-      else if (attr.includes('style')) dimName = 'Style';
-
-      const optionTags = [...sm[2].matchAll(/<option\b[^>]*>([\s\S]*?)<\/option>/gi)];
-      const vals = optionTags
-        .map((o) => decodeHtmlEntities(o[1].replace(/<[^>]+>/g, '').trim()))
-        .filter(
-          (v) =>
-            v &&
-            !v.toLowerCase().includes('choisir') &&
-            !v.toLowerCase().includes('select') &&
-            !v.toLowerCase().includes('sélection')
-        );
-      if (vals.length > 0) {
-        const existing = availableOptions[dimName] || [];
-        availableOptions[dimName] = Array.from(new Set([...existing, ...vals]));
-
-        const selectedOpt = sm[2].match(/<option\b(?=[^>]*\bselected\b)[^>]*>([\s\S]*?)<\/option>/i);
-        if (selectedOpt) {
-          const selVal = decodeHtmlEntities(selectedOpt[1].replace(/<[^>]+>/g, '').trim());
-          if (
-            selVal &&
-            !selVal.toLowerCase().includes('choisir') &&
-            !selectedOptionsList.some((o) => o.startsWith(dimName))
-          ) {
-            selectedOptionsList.push(`${dimName}: ${selVal}`);
-          }
-        }
-      }
-    }
-
-    // Enrich with smart category suggestions
-    const finalAvailableOptions = enrichOptions(availableOptions, title, url);
-
-    const selectedOptionsText = selectedOptionsList.join(', ');
 
     return {
       title: title || 'Produit',
       image: images[0] || '',
-      images: images.slice(0, 10),
+      images,
       price,
-      options: selectedOptionsText,
-      availableOptions: finalAvailableOptions,
+      options: selectedOptionsList.join(', '),
+      availableOptions,
     };
   } catch {
     const slugT = slugToTitle(rawUrl) || 'Produit';
@@ -1342,7 +1269,7 @@ export async function scrapeProductUrl(rawUrl: string): Promise<ScrapedProduct> 
       images: [],
       price: null,
       options: '',
-      availableOptions: enrichOptions({}, slugT, rawUrl),
+      availableOptions: {},
     };
   }
 }
