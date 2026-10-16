@@ -2,6 +2,7 @@
 
 import { useEffect, useState, useRef, useCallback, useMemo, Suspense } from 'react';
 import { useParams, useSearchParams } from 'next/navigation';
+import Link from 'next/link';
 import { getListWithItems, addItemToList, reserveItem, cancelReservation, updateItem, deleteItem } from '@/app/actions/wishlist';
 import { scrapeProductUrl } from '@/app/actions/scrape';
 import {
@@ -756,19 +757,43 @@ function WishlistContent() {
   }
 
   if (!data) {
-    return <div className="p-8 text-center text-red-500">Wishlist not found.</div>;
+    return (
+      <div className="max-w-md mx-auto p-8 text-center space-y-4">
+        <p className="text-red-500 font-medium">Wishlist not found.</p>
+        <Link
+          href="/"
+          className="inline-flex items-center gap-2 bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded-xl text-sm font-semibold transition"
+        >
+          <img src="/favicon.ico" alt="Logo" className="w-5 h-5 rounded object-contain" />
+          <span>Créer une nouvelle liste</span>
+        </Link>
+      </div>
+    );
   }
 
   return (
     <div className="max-w-4xl mx-auto space-y-6">
       <header className="bg-white p-6 rounded-xl shadow flex justify-between items-center gap-4">
-        <div>
-          <h1 className="text-3xl font-bold text-gray-800">{data.list.title}</h1>
-          <p className="text-sm text-gray-500 mt-0.5">
-            {data.isAdmin
-              ? '👑 Mode Créateur (Réservations masquées pour garder la surprise !)'
-              : '👥 Mode Invité (Vous pouvez réserver des articles)'}
-          </p>
+        <div className="flex items-center gap-3.5">
+          <Link
+            href="/"
+            className="flex items-center justify-center p-1 rounded-xl border border-gray-200 hover:border-blue-500 hover:bg-blue-50/50 shadow-xs transition-all group shrink-0"
+            title="Créer une nouvelle liste"
+          >
+            <img
+              src="/favicon.ico"
+              alt="Créer une nouvelle liste"
+              className="w-10 h-10 rounded-lg object-contain transition-transform group-hover:scale-105"
+            />
+          </Link>
+          <div>
+            <h1 className="text-3xl font-bold text-gray-800">{data.list.title}</h1>
+            <p className="text-sm text-gray-500 mt-0.5">
+              {data.isAdmin
+                ? '👑 Mode Créateur (Réservations masquées pour garder la surprise !)'
+                : '👥 Mode Invité (Vous pouvez réserver des articles)'}
+            </p>
+          </div>
         </div>
         <button
           type="button"

@@ -41,6 +41,13 @@ export default function HomePage() {
   return (
     <main className="min-h-screen flex items-center justify-center bg-gray-50 p-4">
       <div className="max-w-md w-full bg-white rounded-xl shadow-md p-6">
+        <div className="flex justify-center mb-3">
+          <img
+            src="/favicon.ico"
+            alt="Wishlist Logo"
+            className="w-12 h-12 rounded-xl object-contain shadow-xs"
+          />
+        </div>
         <h1 className="text-2xl font-bold text-gray-800 mb-4 text-center">
           Create Your Wishlist
         </h1>
