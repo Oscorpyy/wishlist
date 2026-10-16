@@ -4,7 +4,7 @@ import { useEffect, useState, useRef, useCallback, useMemo, Suspense } from 'rea
 import { useParams, useSearchParams } from 'next/navigation';
 import Link from 'next/link';
 import { getListWithItems, addItemToList, reserveItem, cancelReservation, updateItem, deleteItem } from '@/app/actions/wishlist';
-import { scrapeProductUrl } from '@/app/actions/scrape';
+import { scrapeProductUrl, type ScrapedProduct } from '@/app/actions/scrape';
 import {
   parseReservations,
   getItemReservationStats,
@@ -540,11 +540,121 @@ function WishlistContent() {
     }
   };
 
+  const fetchShopifyDirectClient = async (rawUrl: string): Promise<ScrapedProduct | null> => {
+    try {
+      let cleanUrl = rawUrl.trim();
+      if (!cleanUrl.startsWith('http://') && !cleanUrl.startsWith('https://')) {
+        cleanUrl = `https://${cleanUrl}`;
+      }
+      const parsed = new URL(cleanUrl);
+      const match = parsed.pathname.match(/\/products\/([a-zA-Z0-9_%-]+)/);
+      if (!match) return null;
+      const handle = match[1].replace(/\/+$/, '');
+      const jsonUrl = `${parsed.origin}/products/${handle}.json`;
+
+      const res = await fetch(jsonUrl);
+      if (!res.ok) return null;
+      const data = await res.json();
+      const p = data?.product;
+      if (!p || !p.title) return null;
+
+      const images: string[] = [];
+      if (Array.isArray(p.images)) {
+        p.images.forEach((img: unknown) => {
+          const src = typeof img === 'string' ? img : (img as { src?: string })?.src;
+          if (src) {
+            let u = src.trim();
+            if (u.startsWith('//')) u = `https:${u}`;
+            if (!images.includes(u)) images.push(u);
+          }
+        });
+      }
+
+      let price: number | null = null;
+      const variantId = parsed.searchParams.get('variant');
+      let selectedVariant = p.variants?.[0];
+      if (variantId && Array.isArray(p.variants)) {
+        const found = p.variants.find((it: { id?: unknown }) => String(it.id) === variantId);
+        if (found) selectedVariant = found;
+      }
+      if (selectedVariant?.price !== undefined) {
+        let parsedP = parseFloat(String(selectedVariant.price));
+        if (!isNaN(parsedP)) {
+          if (parsedP > 1000 && Number.isInteger(parsedP)) parsedP /= 100;
+          price = parsedP;
+        }
+      }
+
+      const availableOptions: Record<string, string[]> = {};
+      const selectedOptionsList: string[] = [];
+      if (Array.isArray(p.options)) {
+        p.options.forEach((opt: { name?: string; values?: string[] }, idx: number) => {
+          const rawDim = opt.name || `Option ${idx + 1}`;
+          const cleanDim =
+            rawDim.toLowerCase() === 'size' ? 'Taille' : rawDim.toLowerCase() === 'color' ? 'Couleur' : rawDim;
+          if (Array.isArray(opt.values)) {
+            const vals = opt.values.map(String).filter((val) => val && val !== 'Default Title');
+            if (vals.length > 0 && cleanDim !== 'Title') {
+              availableOptions[cleanDim] = vals;
+              const optKey = `option${idx + 1}` as keyof typeof selectedVariant;
+              const selectedVal = selectedVariant?.[optKey];
+              if (selectedVal && selectedVal !== 'Default Title') {
+                selectedOptionsList.push(`${cleanDim}: ${selectedVal}`);
+              }
+            }
+          }
+        });
+      }
+
+      for (const [dim, vals] of Object.entries(availableOptions)) {
+        if (!selectedOptionsList.some((o) => o.startsWith(`${dim}:`)) && vals.length > 0) {
+          selectedOptionsList.push(`${dim}: ${vals[0]}`);
+        }
+      }
+
+      return {
+        title: p.title.replace(/\s*[-|–|—|:]\s*Streetzen(?:\.co)?$/i, '').trim(),
+        image: images[0] || '',
+        images: images.slice(0, 10),
+        price,
+        options: selectedOptionsList.join(', '),
+        availableOptions,
+      };
+    } catch {
+      return null;
+    }
+  };
+
   const handleScrape = async () => {
     if (!url.trim()) return;
     setScraping(true);
     try {
-      const res = await scrapeProductUrl(url);
+      let res: ScrapedProduct | null = null;
+      try {
+        res = await scrapeProductUrl(url);
+      } catch {
+        res = null;
+      }
+
+      // If server action returned incomplete or failed, execute client-side direct fallback for Shopify/Streetzen
+      const isMissingInfo =
+        !res || !res.title || res.title === 'Product' || res.title === 'Produit' || (!res.image && res.price === null);
+
+      if (isMissingInfo && (url.includes('streetzen.co') || url.includes('/products/'))) {
+        try {
+          const clientRes = await fetchShopifyDirectClient(url);
+          if (clientRes && clientRes.title) {
+            res = clientRes;
+          }
+        } catch {
+          // keep res
+        }
+      }
+
+      if (!res || !res.title) {
+        throw new Error('Impossible d’extraire le produit');
+      }
+
       setScrapedTitle(res.title || 'Product');
       setScrapedImage(res.image || '');
       setScrapedImages(res.images && res.images.length > 0 ? res.images : (res.image ? [res.image] : []));

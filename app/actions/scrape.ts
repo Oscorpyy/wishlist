@@ -599,12 +599,11 @@ async function scrapeStreetzen(url: string): Promise<ScrapedProduct | null> {
     let handle = handleMatch ? handleMatch[1].replace(/\/+$/, '') : null;
     const variantIdParam = parsedUrl.searchParams.get('variant');
 
-    const headers = {
-      'User-Agent':
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-      Accept: 'application/json, text/html, application/xhtml+xml, */*',
-      'Accept-Language': 'fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7',
-    };
+    const userAgents = [
+      'facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)',
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+      'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)',
+    ];
 
     // ==========================================
     // Tier 1: Direct Shopify JSON API
@@ -616,13 +615,18 @@ async function scrapeStreetzen(url: string): Promise<ScrapedProduct | null> {
       ];
 
       for (const jsonUrl of Array.from(new Set(candidateJsonUrls))) {
-        try {
-          const res = await fetch(jsonUrl, {
-            headers,
-            signal: AbortSignal.timeout(5000),
-          });
+        for (const ua of userAgents) {
+          try {
+            const res = await fetch(jsonUrl, {
+              headers: {
+                'User-Agent': ua,
+                Accept: 'application/json, text/plain, */*',
+                'Accept-Language': 'fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7',
+              },
+              signal: AbortSignal.timeout(5000),
+            });
 
-          if (res.ok) {
+            if (res.ok) {
             interface ShopifyVariant {
               id?: string | number;
               price?: string | number;
@@ -719,22 +723,38 @@ async function scrapeStreetzen(url: string): Promise<ScrapedProduct | null> {
             }
           }
         } catch {
-          // Continue to next JSON or Tier 2 HTML
+          // Continue to next UA or JSON
         }
       }
     }
+  }
 
     // ==========================================
     // Tier 2: HTML Page Fetch & Deep Extraction
     // ==========================================
-    const pageRes = await fetch(cleanUrl, {
-      headers,
-      signal: AbortSignal.timeout(6000),
-      redirect: 'follow',
-    });
+    let html = '';
+    for (const ua of userAgents) {
+      try {
+        const pageRes = await fetch(cleanUrl, {
+          headers: {
+            'User-Agent': ua,
+            Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+            'Accept-Language': 'fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7',
+          },
+          signal: AbortSignal.timeout(6000),
+          redirect: 'follow',
+        });
+        if (pageRes.ok) {
+          const text = await pageRes.text();
+          if (!text.includes('validateCaptcha') && !text.includes('cf-chl')) {
+            html = text;
+            break;
+          }
+        }
+      } catch {}
+    }
 
-    if (!pageRes.ok) return null;
-    const html = await pageRes.text();
+    if (!html) return null;
     const $ = cheerio.load(html);
 
     // If initial URL had no handle, check canonical URL or collection links
