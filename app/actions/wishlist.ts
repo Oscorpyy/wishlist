@@ -271,11 +271,13 @@ export async function reserveItem(
 export async function cancelReservation(itemId: string, listId: string, reserverName?: string) {
   try {
     assertSupabase();
-    if (reserverName) {
-      let item: { reserved_by?: string | null; quantity?: number | null } | null = null;
+    const targetName = reserverName?.trim();
+
+    if (targetName && targetName !== '__ALL__') {
+      let item: { reserved_by?: string | null; quantity?: number | null; options?: string | null } | null = null;
       const { data: itemData, error: fetchError } = await supabase
         .from('items')
-        .select('reserved_by, quantity')
+        .select('reserved_by, quantity, options')
         .eq('id', itemId)
         .single();
 
@@ -287,7 +289,7 @@ export async function cancelReservation(itemId: string, listId: string, reserver
         ) {
           const { data: fbData } = await supabase
             .from('items')
-            .select('reserved_by')
+            .select('reserved_by, options')
             .eq('id', itemId)
             .single();
           item = fbData;
@@ -298,8 +300,13 @@ export async function cancelReservation(itemId: string, listId: string, reserver
 
       if (item) {
         const existing = parseReservations(item.reserved_by);
-        const filtered = existing.filter((r) => r.name.toLowerCase() !== reserverName.toLowerCase());
-        const totalQty = typeof item.quantity === 'number' && item.quantity > 0 ? item.quantity : 1;
+        const filtered = existing.filter((r) => r.name.trim().toLowerCase() !== targetName.toLowerCase());
+        let totalQty = typeof item.quantity === 'number' && item.quantity > 0 ? item.quantity : 1;
+        if (!item.quantity && item.options) {
+          const match = item.options.match(/\[qty:(\d+)\]/i);
+          if (match) totalQty = parseInt(match[1], 10) || 1;
+        }
+
         const totalReserved = filtered.reduce((s, r) => s + r.count, 0);
         const isFullyReserved = filtered.length > 0 && totalReserved >= totalQty;
 
@@ -321,7 +328,7 @@ export async function cancelReservation(itemId: string, listId: string, reserver
       }
     }
 
-    // Fallback: reset all reservations on this item
+    // Fallback or __ALL__: reset all reservations on this item
     const { error } = await supabase
       .from('items')
       .update({ is_reserved: false, reserved_by: null })

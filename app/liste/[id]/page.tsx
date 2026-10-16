@@ -149,6 +149,12 @@ function WishlistContent() {
   const [reserverName, setReserverName] = useState('');
   const [reserveCount, setReserveCount] = useState(1);
 
+  // Cancel Reservation Modal states
+  const [cancelModalItem, setCancelModalItem] = useState<Item | null>(null);
+  const [selectedReserverToCancel, setSelectedReserverToCancel] = useState<string>('');
+  const [cancellingReservation, setCancellingReservation] = useState(false);
+  const [cancelSuccessMsg, setCancelSuccessMsg] = useState<string | null>(null);
+
   // Filter states
   const [selectedSites, setSelectedSites] = useState<string[]>([]);
   const [priceRange, setPriceRange] = useState<[number, number] | null>(null);
@@ -382,7 +388,10 @@ function WishlistContent() {
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
-        if (showShareModal) {
+        if (cancelModalItem) {
+          setCancelModalItem(null);
+          setCancelSuccessMsg(null);
+        } else if (showShareModal) {
           setShowShareModal(false);
         } else if (editingItem) {
           setEditingItem(null);
@@ -409,7 +418,7 @@ function WishlistContent() {
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [selectedItem, editingItem, showShareModal, reservingItemId, scrapedTitle]);
+  }, [selectedItem, editingItem, showShareModal, reservingItemId, scrapedTitle, cancelModalItem]);
 
   const openEditModal = (item: Item, e?: React.MouseEvent) => {
     if (e) e.stopPropagation();
@@ -671,52 +680,59 @@ function WishlistContent() {
     }
   };
 
-  const handleCancelReservation = async (
-    itemId: string,
+  const openCancelModal = (
+    item: Item,
     e?: React.MouseEvent,
-    existingReservations?: { name: string; count: number }[]
+    providedReservations?: { name: string; count: number }[]
   ) => {
-    if (e) e.stopPropagation();
-    if (!listId) return;
-
-    const reservations = existingReservations || [];
-    let nameToCancel: string | undefined = undefined;
-
-    if (reservations.length > 1) {
-      const promptMessage = `Plusieurs personnes ont réservé cet article (${reservations.map((r) => r.name).join(', ')}).\nEntrez votre nom pour annuler votre réservation (ou laissez vide pour tout annuler) :`;
-      const input = window.prompt(promptMessage);
-      if (input === null) return;
-      if (input.trim()) {
-        nameToCancel = input.trim();
-      } else {
-        if (!confirm('Voulez-vous vraiment annuler TOUTES les réservations pour cet article ?')) {
-          return;
-        }
-      }
-    } else if (reservations.length === 1) {
-      if (!confirm(`Voulez-vous annuler la réservation de ${reservations[0].name} ?`)) {
-        return;
-      }
-      nameToCancel = reservations[0].name;
-    } else {
-      if (!confirm('Voulez-vous annuler la réservation de cet article ?')) {
-        return;
-      }
+    if (e) {
+      e.stopPropagation();
+      e.preventDefault();
     }
+    const reservations = providedReservations || parseReservations(item.reserved_by);
+    setCancelModalItem(item);
+    setCancelSuccessMsg(null);
+    setCancellingReservation(false);
 
+    if (reservations.length > 0) {
+      setSelectedReserverToCancel(reservations[0].name);
+    } else {
+      setSelectedReserverToCancel('__ALL__');
+    }
+  };
+
+  const handleConfirmCancel = async () => {
+    if (!cancelModalItem || !listId) return;
+    setCancellingReservation(true);
     try {
-      const res = await cancelReservation(itemId, listId, nameToCancel);
+      const name = selectedReserverToCancel;
+      const res = await cancelReservation(cancelModalItem.id, listId, name);
       if (res && res.success === false) {
         alert(res.error || 'Erreur lors de l’annulation de la réservation');
+        setCancellingReservation(false);
         return;
       }
+
+      const displayName =
+        name === '__ALL__'
+          ? 'Toutes les réservations ont été annulées'
+          : `La réservation de ${name} a été annulée`;
+      setCancelSuccessMsg(`✓ ${displayName} !`);
+
       await loadList();
+
+      setTimeout(() => {
+        setCancelModalItem(null);
+        setCancelSuccessMsg(null);
+        setCancellingReservation(false);
+      }, 1000);
     } catch (err: unknown) {
       const rawMsg = err instanceof Error ? err.message : 'Erreur lors de l’annulation de la réservation';
       const msg = rawMsg.includes('Minified React error #441')
         ? 'Une erreur serveur est survenue lors de l’annulation de la réservation.'
         : rawMsg;
       alert(msg);
+      setCancellingReservation(false);
     }
   };
 
@@ -1533,7 +1549,7 @@ function WishlistContent() {
                         </span>
                         <button
                           type="button"
-                          onClick={(e) => handleCancelReservation(item.id, e, stats.reservations)}
+                          onClick={(e) => openCancelModal(item, e, stats.reservations)}
                           className="text-xs bg-white hover:bg-red-100 text-red-700 border border-red-200 px-2 py-0.5 rounded shadow-xs transition-colors cursor-pointer shrink-0 font-medium"
                           title="Annuler cette réservation"
                         >
@@ -1590,7 +1606,8 @@ function WishlistContent() {
                           </button>
                           <button
                             type="button"
-                            onClick={() => {
+                            onClick={(e) => {
+                              e.stopPropagation();
                               setReservingItemId(null);
                               setReserverName('');
                               setReserveCount(1);
@@ -1605,17 +1622,27 @@ function WishlistContent() {
                     ) : (
                       <div className="space-y-1.5">
                         {stats.totalQty > 1 && stats.reservedCount > 0 && (
-                          <div className="flex items-center justify-between text-xs px-0.5 text-gray-600">
+                          <div className="flex items-center justify-between gap-1 text-xs px-0.5 text-gray-600">
                             <span
-                              className="truncate text-[11px] text-gray-500 max-w-[65%]"
+                              className="truncate text-[11px] text-gray-500 max-w-[55%]"
                               title={formatReserversTooltip(stats.reservations)}
                             >
                               <strong className="text-amber-700 font-semibold">{stats.reservedCount} pris</strong>{' '}
                               ({formatReserversSummary(stats.reservations)})
                             </span>
-                            <span className="text-xs font-bold text-emerald-700 shrink-0">
-                              {stats.remainingQty}/{stats.totalQty} libre
-                            </span>
+                            <div className="flex items-center gap-1.5 shrink-0">
+                              <span className="text-xs font-bold text-emerald-700">
+                                {stats.remainingQty}/{stats.totalQty} libre
+                              </span>
+                              <button
+                                type="button"
+                                onClick={(e) => openCancelModal(item, e, stats.reservations)}
+                                className="text-[11px] text-red-600 hover:text-red-700 hover:underline font-medium cursor-pointer"
+                                title="Annuler une réservation"
+                              >
+                                Annuler
+                              </button>
+                            </div>
                           </div>
                         )}
                         <button
@@ -1866,7 +1893,7 @@ function WishlistContent() {
                         </span>
                         <button
                           type="button"
-                          onClick={() => handleCancelReservation(selectedItem.id, undefined, modalStats.reservations)}
+                          onClick={(e) => openCancelModal(selectedItem, e, modalStats.reservations)}
                           className="bg-white hover:bg-red-100 text-red-700 border border-red-300 text-xs font-semibold px-3 py-1.5 rounded-lg transition-colors shadow-xs cursor-pointer shrink-0"
                         >
                           Annuler
@@ -1922,7 +1949,8 @@ function WishlistContent() {
                           </button>
                           <button
                             type="button"
-                            onClick={() => {
+                            onClick={(e) => {
+                              e.stopPropagation();
                               setReservingItemId(null);
                               setReserverName('');
                               setReserveCount(1);
@@ -1936,17 +1964,27 @@ function WishlistContent() {
                     ) : (
                       <div className="flex flex-col gap-1.5 w-full">
                         {modalStats.totalQty > 1 && modalStats.reservedCount > 0 && (
-                          <div className="flex items-center justify-between text-xs px-1 text-gray-600">
+                          <div className="flex items-center justify-between gap-2 text-xs px-1 text-gray-600">
                             <span
-                              className="truncate text-xs text-gray-500 max-w-[65%]"
+                              className="truncate text-xs text-gray-500 max-w-[60%]"
                               title={formatReserversTooltip(modalStats.reservations)}
                             >
                               <strong className="text-amber-700 font-semibold">{modalStats.reservedCount} pris</strong>{' '}
                               ({formatReserversSummary(modalStats.reservations)})
                             </span>
-                            <span className="text-xs font-bold text-emerald-700">
-                              {modalStats.remainingQty}/{modalStats.totalQty} libre
-                            </span>
+                            <div className="flex items-center gap-2 shrink-0">
+                              <span className="text-xs font-bold text-emerald-700">
+                                {modalStats.remainingQty}/{modalStats.totalQty} libre
+                              </span>
+                              <button
+                                type="button"
+                                onClick={(e) => openCancelModal(selectedItem, e, modalStats.reservations)}
+                                className="text-xs text-red-600 hover:text-red-700 hover:underline font-medium cursor-pointer"
+                                title="Annuler une réservation"
+                              >
+                                Annuler
+                              </button>
+                            </div>
                           </div>
                         )}
                         <button
@@ -2228,6 +2266,212 @@ function WishlistContent() {
           </div>
         </div>
       )}
+
+      {/* Cancel Reservation Modal Dialog */}
+      {cancelModalItem && (() => {
+        const modalStats = getItemReservationStats(
+          cancelModalItem.quantity,
+          cancelModalItem.reserved_by,
+          cancelModalItem.is_reserved
+        );
+        const reservations = modalStats.reservations;
+        const totalReservedUnits = reservations.reduce((acc, r) => acc + r.count, 0);
+
+        return (
+          <div
+            className="fixed inset-0 z-50 bg-black/60 backdrop-blur-sm flex items-center justify-center p-4 overflow-y-auto"
+            onClick={() => {
+              if (!cancellingReservation) {
+                setCancelModalItem(null);
+                setCancelSuccessMsg(null);
+              }
+            }}
+          >
+            <div
+              className="bg-white rounded-3xl max-w-md w-full p-6 shadow-2xl space-y-5 relative animate-in fade-in duration-150 my-8"
+              onClick={(e) => e.stopPropagation()}
+            >
+              {/* Header */}
+              <div className="flex justify-between items-center pb-3 border-b border-gray-100">
+                <div className="flex items-center gap-3">
+                  <div className="w-10 h-10 rounded-xl bg-red-50 text-red-600 flex items-center justify-center shrink-0">
+                    <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                    </svg>
+                  </div>
+                  <div>
+                    <h3 className="text-lg font-bold text-gray-900">Annuler une réservation</h3>
+                    <p className="text-xs text-gray-500 truncate max-w-[220px] sm:max-w-[280px]">
+                      {cancelModalItem.title}
+                    </p>
+                  </div>
+                </div>
+                {!cancellingReservation && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setCancelModalItem(null);
+                      setCancelSuccessMsg(null);
+                    }}
+                    className="text-gray-400 hover:text-gray-700 p-2 rounded-full hover:bg-gray-100 transition cursor-pointer"
+                    title="Fermer"
+                  >
+                    <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                    </svg>
+                  </button>
+                )}
+              </div>
+
+              {/* Success confirmation message */}
+              {cancelSuccessMsg ? (
+                <div className="py-6 flex flex-col items-center justify-center text-center space-y-3">
+                  <div className="w-14 h-14 rounded-full bg-emerald-100 text-emerald-600 flex items-center justify-center text-2xl font-bold shadow-inner">
+                    ✓
+                  </div>
+                  <div>
+                    <p className="font-bold text-gray-900 text-base">{cancelSuccessMsg}</p>
+                    <p className="text-xs text-gray-500 mt-1">Mise à jour de la liste en cours...</p>
+                  </div>
+                </div>
+              ) : (
+                <>
+                  {/* Reservation List / Details */}
+                  {reservations.length === 0 ? (
+                    <div className="py-4 text-center text-sm text-gray-600">
+                      Aucune réservation active n&apos;a été trouvée pour cet article.
+                    </div>
+                  ) : reservations.length === 1 ? (
+                    <div className="space-y-4">
+                      <p className="text-sm text-gray-600">
+                        Voulez-vous vraiment annuler la réservation suivante ?
+                      </p>
+                      <div className="bg-gray-50 border border-gray-200 rounded-2xl p-4 flex items-center justify-between">
+                        <div className="flex items-center gap-3">
+                          <div className="w-9 h-9 rounded-full bg-blue-100 text-blue-700 font-bold flex items-center justify-center text-sm uppercase">
+                            {reservations[0].name.slice(0, 2)}
+                          </div>
+                          <div>
+                            <p className="font-bold text-gray-900 text-sm">{reservations[0].name}</p>
+                            <p className="text-xs text-gray-500">
+                              {reservations[0].count} {reservations[0].count > 1 ? 'unités réservées' : 'unité réservée'}
+                            </p>
+                          </div>
+                        </div>
+                        <span className="text-xs font-semibold text-emerald-700 bg-emerald-50 border border-emerald-200 px-2.5 py-1 rounded-full">
+                          {reservations[0].count}
+                        </span>
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="space-y-3">
+                      <p className="text-sm text-gray-600">
+                        Plusieurs personnes ont réservé cet article. Sélectionnez la réservation à annuler :
+                      </p>
+
+                      <div className="space-y-2 max-h-56 overflow-y-auto pr-1">
+                        {reservations.map((r) => {
+                          const isSelected = selectedReserverToCancel.toLowerCase() === r.name.toLowerCase();
+                          return (
+                            <label
+                              key={r.name}
+                              className={`flex items-center justify-between p-3.5 rounded-2xl border cursor-pointer transition-all ${
+                                isSelected
+                                  ? 'bg-blue-50/70 border-blue-500 ring-2 ring-blue-200 shadow-xs'
+                                  : 'bg-white border-gray-200 hover:bg-gray-50'
+                              }`}
+                            >
+                              <div className="flex items-center gap-3 min-w-0">
+                                <input
+                                  type="radio"
+                                  name="reserverToCancel"
+                                  value={r.name}
+                                  checked={isSelected}
+                                  onChange={() => setSelectedReserverToCancel(r.name)}
+                                  className="w-4 h-4 text-blue-600 focus:ring-blue-500 border-gray-300"
+                                />
+                                <div className="truncate">
+                                  <p className="font-semibold text-sm text-gray-900 truncate">{r.name}</p>
+                                  <p className="text-xs text-gray-500">
+                                    {r.count} {r.count > 1 ? 'unités réservées' : 'unité réservée'}
+                                  </p>
+                                </div>
+                              </div>
+                              <span className="text-xs font-bold text-blue-700 bg-blue-100/70 px-2.5 py-0.5 rounded-full shrink-0">
+                                {r.count}
+                              </span>
+                            </label>
+                          );
+                        })}
+
+                        {/* Option to cancel all */}
+                        <label
+                          className={`flex items-center justify-between p-3.5 rounded-2xl border cursor-pointer transition-all ${
+                            selectedReserverToCancel === '__ALL__'
+                              ? 'bg-red-50/70 border-red-500 ring-2 ring-red-200 shadow-xs'
+                              : 'bg-white border-gray-200 hover:bg-gray-50'
+                          }`}
+                        >
+                          <div className="flex items-center gap-3 min-w-0">
+                            <input
+                              type="radio"
+                              name="reserverToCancel"
+                              value="__ALL__"
+                              checked={selectedReserverToCancel === '__ALL__'}
+                              onChange={() => setSelectedReserverToCancel('__ALL__')}
+                              className="w-4 h-4 text-red-600 focus:ring-red-500 border-gray-300"
+                            />
+                            <div className="truncate">
+                              <p className="font-semibold text-sm text-red-700">Tout annuler</p>
+                              <p className="text-xs text-red-500">Annule l&apos;ensemble des réservations</p>
+                            </div>
+                          </div>
+                          <span className="text-xs font-bold text-red-700 bg-red-100 px-2.5 py-0.5 rounded-full shrink-0">
+                            {totalReservedUnits}
+                          </span>
+                        </label>
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Actions */}
+                  <div className="flex gap-3 pt-2">
+                    <button
+                      type="button"
+                      disabled={cancellingReservation}
+                      onClick={() => {
+                        setCancelModalItem(null);
+                        setCancelSuccessMsg(null);
+                      }}
+                      className="flex-1 bg-gray-100 hover:bg-gray-200 text-gray-700 font-semibold py-2.5 px-4 rounded-xl transition-colors cursor-pointer text-sm"
+                    >
+                      Retour
+                    </button>
+                    <button
+                      type="button"
+                      disabled={cancellingReservation || reservations.length === 0}
+                      onClick={handleConfirmCancel}
+                      className="flex-1 bg-red-600 hover:bg-red-700 disabled:opacity-50 text-white font-semibold py-2.5 px-4 rounded-xl transition-colors shadow-sm cursor-pointer text-sm flex items-center justify-center gap-2"
+                    >
+                      {cancellingReservation ? (
+                        <>
+                          <svg className="animate-spin h-4 w-4 text-white" fill="none" viewBox="0 0 24 24">
+                            <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                            <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                          </svg>
+                          <span>Annulation...</span>
+                        </>
+                      ) : (
+                        <span>Confirmer l&apos;annulation</span>
+                      )}
+                    </button>
+                  </div>
+                </>
+              )}
+            </div>
+          </div>
+        );
+      })()}
     </div>
   );
 }
