@@ -469,7 +469,7 @@ function WishlistContent() {
         imagePayload = JSON.stringify([finalImageUrl]);
       }
 
-      await updateItem(editingItem.id, listId, {
+      const res = await updateItem(editingItem.id, listId, {
         title: editTitle.trim(),
         price: editPrice ? parseFloat(editPrice) : null,
         image_url: imagePayload,
@@ -478,6 +478,11 @@ function WishlistContent() {
         options: editOptions.trim(),
         quantity: editQuantity,
       });
+
+      if (res && res.success === false) {
+        alert(res.error || 'Erreur lors de la mise à jour');
+        return;
+      }
 
       if (selectedItem && selectedItem.id === editingItem.id) {
         setSelectedItem({
@@ -495,7 +500,10 @@ function WishlistContent() {
       setEditingItem(null);
       await loadList();
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : 'Erreur lors de la mise à jour';
+      const rawMsg = err instanceof Error ? err.message : 'Erreur lors de la mise à jour';
+      const msg = rawMsg.includes('Minified React error #441')
+        ? 'Une erreur serveur est survenue lors de la mise à jour. Veuillez vérifier la connexion ou les permissions Supabase.'
+        : rawMsg;
       alert(msg);
     } finally {
       setSavingEdit(false);
@@ -505,12 +513,19 @@ function WishlistContent() {
   const handleDeleteItem = async (itemId: string) => {
     if (!confirm('Êtes-vous sûr de vouloir supprimer cet article de la liste ?')) return;
     try {
-      await deleteItem(itemId, listId);
+      const res = await deleteItem(itemId, listId);
+      if (res && res.success === false) {
+        alert(res.error || 'Erreur lors de la suppression');
+        return;
+      }
       if (selectedItem && selectedItem.id === itemId) setSelectedItem(null);
       if (editingItem && editingItem.id === itemId) setEditingItem(null);
       loadList();
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : 'Erreur lors de la suppression';
+      const rawMsg = err instanceof Error ? err.message : 'Erreur lors de la suppression';
+      const msg = rawMsg.includes('Minified React error #441')
+        ? 'Une erreur serveur est survenue lors de la suppression.'
+        : rawMsg;
       alert(msg);
     }
   };
@@ -610,7 +625,7 @@ function WishlistContent() {
       imagePayload = JSON.stringify([scrapedImage]);
     }
 
-    await addItemToList({
+    const res = await addItemToList({
       listId,
       title: scrapedTitle,
       price: scrapedPrice ? parseFloat(scrapedPrice) : null,
@@ -620,6 +635,11 @@ function WishlistContent() {
       options,
       quantity,
     });
+
+    if (res && res.success === false) {
+      alert(res.error || 'Erreur lors de l’ajout de l’article');
+      return;
+    }
 
     const maxPref = data?.items?.reduce((max, item) => Math.max(max, item.preference_order || 0), 0) ?? 0;
     setPreference(Math.max(maxPref, preference) + 1);
@@ -632,13 +652,20 @@ function WishlistContent() {
     if (!reserverName.trim() || !listId) return;
     const name = reserverName.trim();
     try {
-      await reserveItem(itemId, listId, name, count);
+      const res = await reserveItem(itemId, listId, name, count);
+      if (res && res.success === false) {
+        alert(res.error || 'Erreur lors de la réservation');
+        return;
+      }
       setReservingItemId(null);
       setReserverName('');
       setReserveCount(1);
       await loadList();
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : 'Erreur lors de la réservation';
+      const rawMsg = err instanceof Error ? err.message : 'Erreur lors de la réservation';
+      const msg = rawMsg.includes('Minified React error #441')
+        ? 'Une erreur serveur est survenue lors de la réservation. Veuillez vérifier les permissions Supabase.'
+        : rawMsg;
       alert(msg);
     }
   };
@@ -677,10 +704,17 @@ function WishlistContent() {
     }
 
     try {
-      await cancelReservation(itemId, listId, nameToCancel);
+      const res = await cancelReservation(itemId, listId, nameToCancel);
+      if (res && res.success === false) {
+        alert(res.error || 'Erreur lors de l’annulation de la réservation');
+        return;
+      }
       await loadList();
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : 'Erreur lors de l’annulation de la réservation';
+      const rawMsg = err instanceof Error ? err.message : 'Erreur lors de l’annulation de la réservation';
+      const msg = rawMsg.includes('Minified React error #441')
+        ? 'Une erreur serveur est survenue lors de l’annulation de la réservation.'
+        : rawMsg;
       alert(msg);
     }
   };
