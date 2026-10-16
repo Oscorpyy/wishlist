@@ -463,6 +463,7 @@ async function scrapeShopify(url: string): Promise<ScrapedProduct | null> {
               'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
             Accept: 'application/json',
           },
+          signal: AbortSignal.timeout(5000),
         });
         if (res.ok) {
           const json = (await res.json()) as ShopifyResponse;
@@ -577,39 +578,387 @@ async function scrapeShopify(url: string): Promise<ScrapedProduct | null> {
 }
 
 /**
- * Dedicated Streetzen extractor (https://streetzen.co).
- * Handles direct product URLs, collection-nested product links, and resolves canonical URLs.
+ * Dedicated, resilient Streetzen extractor (https://streetzen.co).
+ * Handles direct product URLs, collection-nested links, localized subpaths (en-fr, fr, etc.),
+ * and provides a robust 2-tier extraction strategy:
+ *  1. Direct Shopify JSON API with fast timeout (for instant variant, pricing, and image extraction)
+ *  2. Rich HTML Document parsing with Schema.org JSON-LD, embedded Shopify JSON script tags,
+ *     DOM variant selectors, and high-res image gallery deduplication.
  */
 async function scrapeStreetzen(url: string): Promise<ScrapedProduct | null> {
   try {
-    // 1. If path contains /products/, scrapeShopify handles it immediately
-    if (url.includes('/products/')) {
-      const shopifyResult = await scrapeShopify(url);
-      if (shopifyResult) return shopifyResult;
+    let cleanUrl = url.trim();
+    if (!cleanUrl.startsWith('http://') && !cleanUrl.startsWith('https://')) {
+      cleanUrl = `https://${cleanUrl}`;
     }
 
-    // 2. Fetch HTML to detect canonical product URL if URL is rewritten/shortened
-    const res = await fetch(url, {
-      headers: {
-        'User-Agent':
-          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-        Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        'Accept-Language': 'fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7',
-      },
+    const parsedUrl = new URL(cleanUrl);
+
+    // Extract product handle from pathname (supports /products/handle, /collections/.../products/handle, percent-encoded slugs)
+    const handleMatch = parsedUrl.pathname.match(/\/products\/([a-zA-Z0-9_%-]+)/);
+    let handle = handleMatch ? handleMatch[1].replace(/\/+$/, '') : null;
+    const variantIdParam = parsedUrl.searchParams.get('variant');
+
+    const headers = {
+      'User-Agent':
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+      Accept: 'application/json, text/html, application/xhtml+xml, */*',
+      'Accept-Language': 'fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7',
+    };
+
+    // ==========================================
+    // Tier 1: Direct Shopify JSON API
+    // ==========================================
+    if (handle) {
+      const candidateJsonUrls = [
+        `https://streetzen.co/products/${handle}.json`,
+        `${parsedUrl.origin}/products/${handle}.json`,
+      ];
+
+      for (const jsonUrl of Array.from(new Set(candidateJsonUrls))) {
+        try {
+          const res = await fetch(jsonUrl, {
+            headers,
+            signal: AbortSignal.timeout(5000),
+          });
+
+          if (res.ok) {
+            interface ShopifyVariant {
+              id?: string | number;
+              price?: string | number;
+              title?: string;
+              option1?: string;
+              option2?: string;
+              option3?: string;
+              featured_image?: { src?: string } | null;
+            }
+            interface ShopifyProduct {
+              title?: string;
+              images?: Array<string | { src?: string }>;
+              image?: { src?: string };
+              variants?: ShopifyVariant[];
+              options?: Array<{ name?: string; values?: string[] }>;
+            }
+
+            const data = (await res.json()) as { product?: ShopifyProduct };
+            const p = data?.product;
+            if (p && p.title) {
+              const title = cleanTitle(p.title);
+              const images: string[] = [];
+
+              if (Array.isArray(p.images)) {
+                p.images.forEach((img) => {
+                  const src = typeof img === 'string' ? img : img?.src;
+                  const u = normalizeImageUrl(src, cleanUrl);
+                  if (u && !images.includes(u)) images.push(u);
+                });
+              } else if (p.image?.src) {
+                const u = normalizeImageUrl(p.image.src, cleanUrl);
+                if (u && !images.includes(u)) images.push(u);
+              }
+
+              let price: number | null = null;
+              let selectedVariant = p.variants?.[0];
+              if (variantIdParam && Array.isArray(p.variants)) {
+                const match = p.variants.find((v) => String(v.id) === variantIdParam);
+                if (match) selectedVariant = match;
+              }
+
+              if (selectedVariant?.price !== undefined) {
+                let parsedP = parseFloat(String(selectedVariant.price));
+                if (!isNaN(parsedP)) {
+                  if (parsedP > 1000 && Number.isInteger(parsedP)) parsedP /= 100;
+                  price = parsedP;
+                }
+              }
+
+              // Elevate variant image if available
+              if (selectedVariant?.featured_image?.src) {
+                const varImg = normalizeImageUrl(selectedVariant.featured_image.src, cleanUrl);
+                if (varImg) {
+                  const idx = images.indexOf(varImg);
+                  if (idx > -1) images.splice(idx, 1);
+                  images.unshift(varImg);
+                }
+              }
+
+              const availableOptions: Record<string, string[]> = {};
+              const selectedOptionsList: string[] = [];
+
+              if (Array.isArray(p.options)) {
+                p.options.forEach((opt, idx) => {
+                  const dimName = translateDimension(opt.name || `Option ${idx + 1}`);
+                  if (Array.isArray(opt.values)) {
+                    const vals = opt.values.map(String).filter((v) => v && v !== 'Default Title');
+                    if (vals.length > 0 && dimName !== 'Title') {
+                      availableOptions[dimName] = vals;
+                      const optKey = `option${idx + 1}` as keyof ShopifyVariant;
+                      const selectedVal = selectedVariant?.[optKey];
+                      if (selectedVal && selectedVal !== 'Default Title') {
+                        selectedOptionsList.push(`${dimName}: ${selectedVal}`);
+                      }
+                    }
+                  }
+                });
+              }
+
+              for (const [dim, vals] of Object.entries(availableOptions)) {
+                if (!selectedOptionsList.some((o) => o.startsWith(`${dim}:`)) && vals.length > 0) {
+                  selectedOptionsList.push(`${dim}: ${vals[0]}`);
+                }
+              }
+
+              return {
+                title,
+                image: images[0] || '',
+                images: images.slice(0, 10),
+                price,
+                options: selectedOptionsList.join(', '),
+                availableOptions,
+              };
+            }
+          }
+        } catch {
+          // Continue to next JSON or Tier 2 HTML
+        }
+      }
+    }
+
+    // ==========================================
+    // Tier 2: HTML Page Fetch & Deep Extraction
+    // ==========================================
+    const pageRes = await fetch(cleanUrl, {
+      headers,
+      signal: AbortSignal.timeout(6000),
+      redirect: 'follow',
     });
-    if (!res.ok) return null;
-    const html = await res.text();
+
+    if (!pageRes.ok) return null;
+    const html = await pageRes.text();
     const $ = cheerio.load(html);
 
-    const canonicalHref = $('link[rel="canonical"]').attr('href');
-    if (canonicalHref && canonicalHref.includes('/products/')) {
-      const canonicalResult = await scrapeShopify(canonicalHref);
-      if (canonicalResult) return canonicalResult;
+    // If initial URL had no handle, check canonical URL or collection links
+    if (!handle) {
+      const canonical = $('link[rel="canonical"]').attr('href');
+      const canonicalMatch = canonical?.match(/\/products\/([a-zA-Z0-9_%-]+)/);
+      if (canonicalMatch) {
+        handle = canonicalMatch[1];
+      } else {
+        const firstProdLink = $('a[href*="/products/"]').first().attr('href');
+        const firstMatch = firstProdLink?.match(/\/products\/([a-zA-Z0-9_%-]+)/);
+        if (firstMatch) handle = firstMatch[1];
+      }
     }
+
+    let title = '';
+    let price: number | null = null;
+    const images: string[] = [];
+    const availableOptions: Record<string, string[]> = {};
+    const selectedOptionsList: string[] = [];
+
+    // Title from OpenGraph or Title tag
+    const ogTitle = $('meta[property="og:title"]').attr('content') || $('title').text();
+    if (ogTitle) title = cleanTitle(ogTitle);
+
+    // 1. Check Schema.org JSON-LD
+    interface JsonLdOffer {
+      price?: string | number;
+      priceCurrency?: string;
+    }
+    interface JsonLdProd {
+      name?: string;
+      offers?: JsonLdOffer | JsonLdOffer[];
+      image?: string | string[] | { url?: string };
+      [key: string]: unknown;
+    }
+
+    let ldProduct: JsonLdProd | null = null;
+    for (const el of $('script[type="application/ld+json"]').toArray()) {
+      try {
+        const parsed = JSON.parse($(el).text().trim()) as Record<string, unknown>;
+        const type = parsed['@type'];
+        if (type === 'Product' || (Array.isArray(type) && type.includes('Product'))) {
+          ldProduct = parsed as JsonLdProd;
+          break;
+        }
+      } catch {}
+    }
+
+    if (ldProduct) {
+      const prod = ldProduct as JsonLdProd;
+      if (!title && prod.name) title = cleanTitle(prod.name);
+      if (prod.offers) {
+        const offers = Array.isArray(prod.offers) ? prod.offers : [prod.offers];
+        const offer = offers[0];
+        if (offer?.price !== undefined) {
+          const p = parseFloat(String(offer.price));
+          if (!isNaN(p) && p > 0) price = p;
+        }
+      }
+      if (prod.image) {
+        const addLdImg = (im: unknown) => {
+          const raw = typeof im === 'string' ? im : (im as { url?: string })?.url;
+          const u = normalizeImageUrl(raw, cleanUrl);
+          if (u && !images.includes(u)) images.push(u);
+        };
+        if (Array.isArray(prod.image)) prod.image.forEach(addLdImg);
+        else addLdImg(prod.image);
+      }
+    }
+
+    // 2. Check embedded Shopify product JSON scripts
+    interface EmbeddedVariant {
+      id?: string | number;
+      price?: string | number;
+      options?: string[];
+    }
+    interface EmbeddedOption {
+      name?: string;
+      defaultName?: string;
+      values?: string[];
+      optionValues?: Array<{ name?: string; value?: string; label?: string }>;
+    }
+    interface EmbeddedProd {
+      handle?: string;
+      title?: string;
+      price?: string | number;
+      variants?: EmbeddedVariant[];
+      options?: EmbeddedOption[];
+      images?: Array<string | { src?: string }>;
+    }
+
+    let embeddedProduct: EmbeddedProd | null = null;
+    for (const el of $('script[type="application/json"]').toArray()) {
+      try {
+        const text = $(el).text().trim();
+        if (text.length < 50) continue;
+        const parsed = JSON.parse(text) as EmbeddedProd;
+        if (parsed && (parsed.handle || parsed.variants) && (parsed.title || parsed.options)) {
+          embeddedProduct = parsed;
+          break;
+        }
+      } catch {}
+    }
+
+    if (embeddedProduct) {
+      const prod = embeddedProduct as EmbeddedProd;
+      if (!title && prod.title) title = cleanTitle(prod.title);
+
+      if (price === null && Array.isArray(prod.variants) && prod.variants.length > 0) {
+        let v = prod.variants[0];
+        if (variantIdParam) {
+          const match = prod.variants.find((item: EmbeddedVariant) => String(item.id) === variantIdParam);
+          if (match) v = match;
+        }
+        if (v?.price !== undefined) {
+          let p = parseFloat(String(v.price));
+          if (p > 1000 && Number.isInteger(p)) p /= 100;
+          if (!isNaN(p) && p > 0) price = p;
+        }
+      }
+
+      if (Array.isArray(prod.images)) {
+        prod.images.forEach((im: string | { src?: string }) => {
+          const src = typeof im === 'string' ? im : im?.src;
+          const u = normalizeImageUrl(src, cleanUrl);
+          if (u && !images.includes(u)) images.push(u);
+        });
+      }
+
+      if (Array.isArray(prod.options)) {
+        prod.options.forEach((opt: EmbeddedOption, idx: number) => {
+          const dimName = translateDimension(opt.name || opt.defaultName || `Option ${idx + 1}`);
+          let vals: string[] = [];
+          if (Array.isArray(opt.optionValues)) {
+            vals = opt.optionValues
+              .map((v: { name?: string; value?: string; label?: string }) => v.name || v.value || v.label)
+              .filter((v): v is string => Boolean(v));
+          } else if (Array.isArray(opt.values)) {
+            vals = opt.values.map(String).filter(Boolean);
+          }
+          if (vals.length > 0 && dimName !== 'Title') {
+            availableOptions[dimName] = vals;
+            if (!selectedOptionsList.some((o) => o.startsWith(dimName))) {
+              selectedOptionsList.push(`${dimName}: ${vals[0]}`);
+            }
+          }
+        });
+      }
+    }
+
+    // 3. Fallback price from variant select options or HTML text
+    if (price === null) {
+      $('select.product-single__variants option, form[action*="/cart/add"] option').each((_, el) => {
+        const optText = $(el).text();
+        const match = optText.match(/([€$£])\s*(\d+[.,]\d{2})|(\d+[.,]\d{2})\s*([€$£]|EUR|USD)/i);
+        if (match && price === null) {
+          const numStr = (match[2] || match[3]).replace(',', '.');
+          const p = parseFloat(numStr);
+          if (!isNaN(p) && p > 0) price = p;
+        }
+      });
+    }
+
+    // 4. OpenGraph image fallback
+    const ogImg = $('meta[property="og:image"]').attr('content');
+    if (ogImg) {
+      const u = normalizeImageUrl(ogImg, cleanUrl);
+      if (u && !images.includes(u)) images.unshift(u);
+    }
+
+    // 5. DOM Gallery images (excluding icons and non-product graphics)
+    $('img').each((_, el) => {
+      const src = $(el).attr('src') || $(el).attr('data-src') || $(el).attr('data-photoswipe-src');
+      if (src && (src.includes('cdn/shop/files') || src.includes('cdn.shopify.com/s/files'))) {
+        const lower = src.toLowerCase();
+        if (
+          !lower.includes('logo') &&
+          !lower.includes('icon') &&
+          !lower.includes('badge') &&
+          !lower.includes('png-02') &&
+          !lower.includes('png-03')
+        ) {
+          const cleanSrc = normalizeImageUrl(src.replace(/_(?:small|compact|medium|thumb)\./i, '.'), cleanUrl);
+          if (cleanSrc && !images.includes(cleanSrc)) images.push(cleanSrc);
+        }
+      }
+    });
+
+    // 6. DOM Options fallback (fieldset.variant-input-wrap)
+    if (Object.keys(availableOptions).length === 0) {
+      $('fieldset.variant-input-wrap').each((_, el) => {
+        const rawDim = $(el).attr('name') || $(el).find('legend').text().trim() || 'Option';
+        const cleanDim = translateDimension(rawDim);
+        const vals: string[] = [];
+        $(el).find('input[type="radio"], label').each((__, inp) => {
+          const val = $(inp).attr('value') || $(inp).text().trim();
+          if (val && !vals.includes(val) && val.length < 30) vals.push(val);
+        });
+        if (vals.length > 0) {
+          availableOptions[cleanDim] = vals;
+          if (!selectedOptionsList.some((o) => o.startsWith(cleanDim))) {
+            selectedOptionsList.push(`${cleanDim}: ${vals[0]}`);
+          }
+        }
+      });
+    }
+
+    if (!title) {
+      const h1 = $('h1.product-single__title, h1.product__title, h1').first().text().trim();
+      if (h1) title = cleanTitle(h1);
+    }
+
+    return {
+      title: title || 'Streetzen Produit',
+      image: images[0] || '',
+      images: images.slice(0, 10),
+      price,
+      options: selectedOptionsList.join(', '),
+      availableOptions,
+    };
   } catch {
-    // fallback
+    return null;
   }
-  return null;
 }
 
 /**
