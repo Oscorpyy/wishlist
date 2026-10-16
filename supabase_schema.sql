@@ -17,10 +17,14 @@ create table if not exists public.items (
   product_url text default '',
   preference_order integer default 1,
   options text default '',
+  quantity integer default 1,
   is_reserved boolean default false,
   reserved_by text,
   created_at timestamp with time zone default timezone('utc'::text, now()) not null
 );
+
+-- Migration for existing databases:
+alter table public.items add column if not exists quantity integer default 1;
 
 -- Enable Row Level Security (optional / policy open for anonymous access if needed)
 alter table public.lists enable row level security;

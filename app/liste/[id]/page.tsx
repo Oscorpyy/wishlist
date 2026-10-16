@@ -1,9 +1,16 @@
 'use client';
 
-import { useEffect, useState, useRef, useCallback, Suspense } from 'react';
+import { useEffect, useState, useRef, useCallback, useMemo, Suspense } from 'react';
 import { useParams, useSearchParams } from 'next/navigation';
 import { getListWithItems, addItemToList, reserveItem, cancelReservation, updateItem, deleteItem } from '@/app/actions/wishlist';
 import { scrapeProductUrl } from '@/app/actions/scrape';
+import {
+  parseReservations,
+  getItemReservationStats,
+  formatReserversSummary,
+  formatReserversTooltip,
+  formatQuantityAvailability,
+} from '@/lib/reservations';
 
 interface Item {
   id: string;
@@ -13,6 +20,7 @@ interface Item {
   product_url: string;
   preference_order: number;
   options?: string;
+  quantity?: number;
   is_reserved?: boolean;
   reserved_by?: string;
 }
@@ -21,6 +29,53 @@ interface ListData {
   list: { id: string; title: string };
   items: Item[];
   isAdmin: boolean;
+}
+
+// Helper to extract clean site/store name from product URL
+function extractSiteName(rawUrl: string | undefined | null): string {
+  if (!rawUrl || typeof rawUrl !== 'string') return 'Autre';
+  try {
+    let u = rawUrl.trim();
+    if (!u.startsWith('http://') && !u.startsWith('https://')) {
+      u = `https://${u}`;
+    }
+    const host = new URL(u).hostname.toLowerCase().replace(/^www\./, '');
+    if (host.includes('amazon.') || host.includes('amzn.')) return 'Amazon';
+    if (host.includes('streetzen.co')) return 'Streetzen';
+    if (host.includes('displate.com')) return 'Displate';
+    if (host.includes('lego.com')) return 'LEGO';
+    if (host.includes('fnac.com')) return 'Fnac';
+    if (host.includes('darty.com')) return 'Darty';
+    if (host.includes('boulanger.com')) return 'Boulanger';
+    if (host.includes('cdiscount.com')) return 'Cdiscount';
+    if (host.includes('decathlon.')) return 'Decathlon';
+    if (host.includes('nike.com')) return 'Nike';
+    if (host.includes('rhinoshield.')) return 'Rhinoshield';
+    if (host.includes('maxesport.')) return 'Maxesport';
+    if (host.includes('aliexpress.com')) return 'AliExpress';
+    if (host.includes('sephora.')) return 'Sephora';
+    if (host.includes('zara.com')) return 'Zara';
+    if (host.includes('uniqlo.com')) return 'Uniqlo';
+    if (host.includes('asos.com')) return 'ASOS';
+    if (host.includes('apple.com')) return 'Apple';
+    if (host.includes('ebay.')) return 'eBay';
+    if (host.includes('montblanc.com')) return 'Montblanc';
+    if (host.includes('maty.com')) return 'Maty';
+    if (host.includes('topachat.com')) return 'TopAchat';
+    if (host.includes('materiel.net')) return 'Materiel.net';
+    if (host.includes('ldlc.com')) return 'LDLC';
+
+    const domainParts = host.split('.');
+    let s = domainParts[0];
+    if (domainParts.length > 2 && /^(co|com|org|net|gov|edu)$/i.test(domainParts[domainParts.length - 2])) {
+      s = domainParts[domainParts.length - 3];
+    } else if (domainParts.length >= 2) {
+      s = domainParts[domainParts.length - 2];
+    }
+    return s.charAt(0).toUpperCase() + s.slice(1);
+  } catch {
+    return 'Autre';
+  }
 }
 
 // Helper to parse single or multiple images
@@ -68,6 +123,7 @@ function WishlistContent() {
   const [scrapedImages, setScrapedImages] = useState<string[]>([]);
   const [scrapedPrice, setScrapedPrice] = useState<string>('');
   const [preference, setPreference] = useState(1);
+  const [quantity, setQuantity] = useState(1);
   const [options, setOptions] = useState('');
   const [scrapedAvailableOptions, setScrapedAvailableOptions] = useState<Record<string, string[]>>({});
 
@@ -79,6 +135,7 @@ function WishlistContent() {
   const [editingItem, setEditingItem] = useState<Item | null>(null);
   const [editTitle, setEditTitle] = useState('');
   const [editPrice, setEditPrice] = useState('');
+  const [editQuantity, setEditQuantity] = useState(1);
   const [editImageUrl, setEditImageUrl] = useState('');
   const [editImages, setEditImages] = useState<string[]>([]);
   const [editProductUrl, setEditProductUrl] = useState('');
@@ -89,6 +146,13 @@ function WishlistContent() {
   // Form states for reserving an item
   const [reservingItemId, setReservingItemId] = useState<string | null>(null);
   const [reserverName, setReserverName] = useState('');
+  const [reserveCount, setReserveCount] = useState(1);
+
+  // Filter states
+  const [selectedSites, setSelectedSites] = useState<string[]>([]);
+  const [priceRange, setPriceRange] = useState<[number, number] | null>(null);
+  const [includeNoPrice, setIncludeNoPrice] = useState(true);
+  const [hideReserved, setHideReserved] = useState(false);
 
   const loadList = useCallback(async () => {
     if (!listId) return;
@@ -121,6 +185,10 @@ function WishlistContent() {
     if (listData && listData.items) {
       const maxPref = listData.items.reduce((max, item) => Math.max(max, item.preference_order || 0), 0);
       setPreference(maxPref + 1);
+      setSelectedItem((prev) => {
+        if (!prev) return null;
+        return listData.items.find((it) => it.id === prev.id) || prev;
+      });
     }
     setLoading(false);
   }, [listId, adminKey]);
@@ -129,6 +197,151 @@ function WishlistContent() {
     // eslint-disable-next-line react-hooks/set-state-in-effect
     loadList();
   }, [loadList]);
+
+  // Calculate dynamic price bounds from the current items
+  const { minPriceBound, maxPriceBound, hasPricedItems, unpricedCount } = useMemo(() => {
+    if (!data?.items || data.items.length === 0) {
+      return { minPriceBound: 0, maxPriceBound: 0, hasPricedItems: false, unpricedCount: 0 };
+    }
+    const numericPrices = data.items
+      .map((i) => i.price)
+      .filter((p): p is number => typeof p === 'number' && !isNaN(p));
+
+    const unpriced = data.items.filter((i) => i.price === null || i.price === undefined).length;
+
+    if (numericPrices.length === 0) {
+      return { minPriceBound: 0, maxPriceBound: 0, hasPricedItems: false, unpricedCount: unpriced };
+    }
+
+    const min = Math.floor(Math.min(...numericPrices));
+    const max = Math.ceil(Math.max(...numericPrices));
+    return { minPriceBound: min, maxPriceBound: max, hasPricedItems: true, unpricedCount: unpriced };
+  }, [data?.items]);
+
+  // Dynamic available sites strictly from items in current list
+  const availableSites = useMemo(() => {
+    if (!data?.items) return [];
+    const map = new Map<string, number>();
+    data.items.forEach((item) => {
+      const site = extractSiteName(item.product_url);
+      map.set(site, (map.get(site) || 0) + 1);
+    });
+    return Array.from(map.entries())
+      .map(([name, count]) => ({ name, count }))
+      .sort((a, b) => b.count - a.count || a.name.localeCompare(b.name));
+  }, [data?.items]);
+
+  // Effective min/max for sliders (guaranteed min < max when minPriceBound < maxPriceBound)
+  const effectiveMin = priceRange
+    ? Math.max(minPriceBound, Math.min(priceRange[0], maxPriceBound > minPriceBound ? maxPriceBound - 1 : maxPriceBound))
+    : minPriceBound;
+  const effectiveMax = priceRange
+    ? Math.min(maxPriceBound, Math.max(priceRange[1], maxPriceBound > minPriceBound ? minPriceBound + 1 : minPriceBound))
+    : maxPriceBound;
+
+  // Handlers for price bounds ensuring they can never be equivalent (min < max)
+  const handleMinPriceChange = (newVal: number) => {
+    if (isNaN(newVal)) return;
+    const val = Math.max(minPriceBound, Math.min(newVal, maxPriceBound));
+    if (val < effectiveMax) {
+      setPriceRange([val, effectiveMax]);
+    } else if (val === effectiveMax) {
+      if (effectiveMax < maxPriceBound) {
+        setPriceRange([effectiveMax, effectiveMax + 1]);
+      } else if (effectiveMax > minPriceBound) {
+        setPriceRange([effectiveMax - 1, effectiveMax]);
+      }
+    } else {
+      // Dragged past max
+      if (val < maxPriceBound) {
+        setPriceRange([effectiveMax, val]);
+      } else {
+        setPriceRange([effectiveMax, maxPriceBound]);
+      }
+    }
+  };
+
+  const handleMaxPriceChange = (newVal: number) => {
+    if (isNaN(newVal)) return;
+    const val = Math.max(minPriceBound, Math.min(newVal, maxPriceBound));
+    if (val > effectiveMin) {
+      setPriceRange([effectiveMin, val]);
+    } else if (val === effectiveMin) {
+      if (effectiveMin > minPriceBound) {
+        setPriceRange([effectiveMin - 1, effectiveMin]);
+      } else if (effectiveMin < maxPriceBound) {
+        setPriceRange([effectiveMin, effectiveMin + 1]);
+      }
+    } else {
+      // Dragged below min
+      if (val > minPriceBound) {
+        setPriceRange([val, effectiveMin]);
+      } else {
+        setPriceRange([minPriceBound, effectiveMin]);
+      }
+    }
+  };
+
+  // Filtered items list based on active criteria
+  const filteredItems = useMemo(() => {
+    if (!data?.items) return [];
+
+    return data.items.filter((item) => {
+      // 1. Site filter
+      if (selectedSites.length > 0) {
+        const itemSite = extractSiteName(item.product_url);
+        if (!selectedSites.includes(itemSite)) {
+          return false;
+        }
+      }
+
+      // 2. Price filter
+      if (hasPricedItems && priceRange !== null) {
+        if (item.price === null || item.price === undefined) {
+          if (!includeNoPrice) return false;
+        } else {
+          if (item.price < effectiveMin || item.price > effectiveMax) {
+            return false;
+          }
+        }
+      }
+
+      // 3. Optional reservation filter (for guests)
+      if (hideReserved) {
+        const stats = getItemReservationStats(item.quantity, item.reserved_by, item.is_reserved);
+        if (stats.isFullyReserved) {
+          return false;
+        }
+      }
+
+      return true;
+    });
+  }, [data?.items, selectedSites, priceRange, hasPricedItems, includeNoPrice, effectiveMin, effectiveMax, hideReserved]);
+
+  const isPriceFiltered = hasPricedItems && priceRange !== null && (effectiveMin > minPriceBound || effectiveMax < maxPriceBound);
+  const isSiteFiltered = selectedSites.length > 0;
+  const isFiltered = isPriceFiltered || isSiteFiltered || (!includeNoPrice && unpricedCount > 0) || hideReserved;
+
+  const handleToggleSite = (siteName: string) => {
+    setSelectedSites((prev) =>
+      prev.includes(siteName) ? prev.filter((s) => s !== siteName) : [...prev, siteName]
+    );
+  };
+
+  const handleSelectAllSites = () => {
+    if (selectedSites.length === availableSites.length) {
+      setSelectedSites([]);
+    } else {
+      setSelectedSites(availableSites.map((s) => s.name));
+    }
+  };
+
+  const handleResetFilters = () => {
+    setSelectedSites([]);
+    setPriceRange(null);
+    setIncludeNoPrice(true);
+    setHideReserved(false);
+  };
 
   const handleShare = () => {
     const guestUrl = `${window.location.origin}/liste/${listId}`;
@@ -144,6 +357,7 @@ function WishlistContent() {
   const fieldRef0 = useRef<HTMLInputElement>(null);
   const fieldRef1 = useRef<HTMLInputElement>(null);
   const fieldRef2 = useRef<HTMLInputElement>(null);
+  const fieldRefQuantity = useRef<HTMLInputElement>(null);
   const fieldRef3 = useRef<HTMLInputElement>(null);
   const fieldRef4 = useRef<HTMLInputElement>(null);
   const submitRef = useRef<HTMLButtonElement>(null);
@@ -155,6 +369,7 @@ function WishlistContent() {
     setScrapedImage('');
     setScrapedImages([]);
     setScrapedPrice('');
+    setQuantity(1);
     setOptions('');
     setScrapedAvailableOptions({});
     setTimeout(() => {
@@ -175,6 +390,7 @@ function WishlistContent() {
         } else if (reservingItemId) {
           setReservingItemId(null);
           setReserverName('');
+          setReserveCount(1);
         } else if (scrapedTitle) {
           handleCancelAddItem();
         }
@@ -199,6 +415,7 @@ function WishlistContent() {
     setEditingItem(item);
     setEditTitle(item.title);
     setEditPrice(item.price !== null ? item.price.toString() : '');
+    setEditQuantity(item.quantity || 1);
 
     // Parse image array so we display a clean single URL in the input field, not a JSON string!
     const imgs = parseItemImages(item.image_url);
@@ -259,6 +476,7 @@ function WishlistContent() {
         product_url: finalProductUrl,
         preference_order: editPreference,
         options: editOptions.trim(),
+        quantity: editQuantity,
       });
 
       if (selectedItem && selectedItem.id === editingItem.id) {
@@ -270,6 +488,7 @@ function WishlistContent() {
           product_url: finalProductUrl,
           preference_order: editPreference,
           options: editOptions.trim(),
+          quantity: editQuantity,
         });
       }
 
@@ -305,6 +524,7 @@ function WishlistContent() {
       setScrapedImage(res.image || '');
       setScrapedImages(res.images && res.images.length > 0 ? res.images : (res.image ? [res.image] : []));
       setScrapedPrice(res.price !== null ? res.price.toString() : '');
+      setQuantity(1);
       setOptions(res.options || '');
       setScrapedAvailableOptions(res.availableOptions || {});
       const maxPref = data?.items?.reduce((max, item) => Math.max(max, item.preference_order || 0), 0) ?? 0;
@@ -319,6 +539,7 @@ function WishlistContent() {
     } catch {
       alert('Impossible d’extraire automatiquement les informations du produit. Vous pouvez remplir les champs manuellement.');
       setScrapedTitle('Produit');
+      setQuantity(1);
       setLastScrapedUrl(url);
       setTimeout(() => {
         fieldRef0.current?.focus();
@@ -397,6 +618,7 @@ function WishlistContent() {
       url,
       preferenceOrder: preference,
       options,
+      quantity,
     });
 
     const maxPref = data?.items?.reduce((max, item) => Math.max(max, item.preference_order || 0), 0) ?? 0;
@@ -406,35 +628,56 @@ function WishlistContent() {
     loadList();
   };
 
-  const handleReserve = async (itemId: string) => {
+  const handleReserve = async (itemId: string, count: number = 1) => {
     if (!reserverName.trim() || !listId) return;
-    await reserveItem(itemId, listId, reserverName);
-    setReservingItemId(null);
-    setReserverName('');
-    if (selectedItem && selectedItem.id === itemId) {
-      setSelectedItem({
-        ...selectedItem,
-        is_reserved: true,
-        reserved_by: reserverName,
-      });
+    const name = reserverName.trim();
+    try {
+      await reserveItem(itemId, listId, name, count);
+      setReservingItemId(null);
+      setReserverName('');
+      setReserveCount(1);
+      await loadList();
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'Erreur lors de la réservation';
+      alert(msg);
     }
-    loadList();
   };
 
-  const handleCancelReservation = async (itemId: string, e?: React.MouseEvent) => {
+  const handleCancelReservation = async (
+    itemId: string,
+    e?: React.MouseEvent,
+    existingReservations?: { name: string; count: number }[]
+  ) => {
     if (e) e.stopPropagation();
     if (!listId) return;
-    if (!confirm('Voulez-vous annuler la réservation de cet article ?')) return;
+
+    const reservations = existingReservations || [];
+    let nameToCancel: string | undefined = undefined;
+
+    if (reservations.length > 1) {
+      const promptMessage = `Plusieurs personnes ont réservé cet article (${reservations.map((r) => r.name).join(', ')}).\nEntrez votre nom pour annuler votre réservation (ou laissez vide pour tout annuler) :`;
+      const input = window.prompt(promptMessage);
+      if (input === null) return;
+      if (input.trim()) {
+        nameToCancel = input.trim();
+      } else {
+        if (!confirm('Voulez-vous vraiment annuler TOUTES les réservations pour cet article ?')) {
+          return;
+        }
+      }
+    } else if (reservations.length === 1) {
+      if (!confirm(`Voulez-vous annuler la réservation de ${reservations[0].name} ?`)) {
+        return;
+      }
+      nameToCancel = reservations[0].name;
+    } else {
+      if (!confirm('Voulez-vous annuler la réservation de cet article ?')) {
+        return;
+      }
+    }
 
     try {
-      await cancelReservation(itemId, listId);
-      if (selectedItem && selectedItem.id === itemId) {
-        setSelectedItem({
-          ...selectedItem,
-          is_reserved: false,
-          reserved_by: undefined,
-        });
-      }
+      await cancelReservation(itemId, listId, nameToCancel);
       await loadList();
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : 'Erreur lors de l’annulation de la réservation';
@@ -452,7 +695,7 @@ function WishlistContent() {
       if (e.shiftKey) {
         // Shift + Enter: Strictly navigates between text zones
         e.preventDefault();
-        const refs = [fieldRef0, fieldRef1, fieldRef2, fieldRef3, fieldRef4];
+        const refs = [fieldRef0, fieldRef1, fieldRef2, fieldRefQuantity, fieldRef3, fieldRef4];
         if (index < refs.length - 1) {
           refs[index + 1].current?.focus();
           refs[index + 1].current?.select();
@@ -667,9 +910,9 @@ function WishlistContent() {
                 )}
               </div>
 
-              <div className="grid grid-cols-2 gap-4">
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
                 <div>
-                  <label className="block text-sm font-medium text-gray-700">Price (€)</label>
+                  <label className="block text-sm font-medium text-gray-700 mb-1">Price (€)</label>
                   <input
                     ref={fieldRef2}
                     type="number"
@@ -681,7 +924,43 @@ function WishlistContent() {
                   />
                 </div>
                 <div>
-                  <label className="block text-sm font-medium text-gray-700">
+                  <label className="block text-sm font-medium text-gray-700 mb-1">
+                    Quantité
+                  </label>
+                  <div className="flex items-center border border-gray-300 rounded-lg overflow-hidden bg-white focus-within:ring-2 focus-within:ring-blue-500 focus-within:border-blue-500">
+                    <button
+                      type="button"
+                      onClick={() => setQuantity((q) => Math.max(1, q - 1))}
+                      className="px-3 py-2 bg-gray-50 hover:bg-gray-100 text-gray-700 font-bold text-sm border-r border-gray-200 transition-colors cursor-pointer select-none"
+                      title="Diminuer la quantité"
+                    >
+                      −
+                    </button>
+                    <input
+                      ref={fieldRefQuantity}
+                      type="number"
+                      min={1}
+                      max={999}
+                      value={quantity}
+                      onChange={(e) => {
+                        const val = parseInt(e.target.value, 10);
+                        setQuantity(isNaN(val) || val < 1 ? 1 : val);
+                      }}
+                      onKeyDown={(e) => handleFormKeyDown(e, 3)}
+                      className="w-full text-center py-2 text-black font-semibold text-sm focus:outline-none [appearance:textfield] [&::-webkit-outer-spin-button]:appearance-none [&::-webkit-inner-spin-button]:appearance-none"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => setQuantity((q) => q + 1)}
+                      className="px-3 py-2 bg-gray-50 hover:bg-gray-100 text-gray-700 font-bold text-sm border-l border-gray-200 transition-colors cursor-pointer select-none"
+                      title="Augmenter la quantité"
+                    >
+                      +
+                    </button>
+                  </div>
+                </div>
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-1">
                     Preference Rank (1 = Top)
                   </label>
                   <input
@@ -689,7 +968,7 @@ function WishlistContent() {
                     type="number"
                     value={preference}
                     onChange={(e) => setPreference(parseInt(e.target.value) || 1)}
-                    onKeyDown={(e) => handleFormKeyDown(e, 3)}
+                    onKeyDown={(e) => handleFormKeyDown(e, 4)}
                     className="w-full border rounded-lg px-3 py-2 text-black"
                     min={1}
                   />
@@ -705,7 +984,7 @@ function WishlistContent() {
                   placeholder="e.g. Taille: 5 m, Couleur: Blanc"
                   value={options}
                   onChange={(e) => setOptions(e.target.value)}
-                  onKeyDown={(e) => handleFormKeyDown(e, 4)}
+                  onKeyDown={(e) => handleFormKeyDown(e, 5)}
                   className="w-full border rounded-lg px-3 py-2 text-black"
                 />
 
@@ -776,11 +1055,266 @@ function WishlistContent() {
         </section>
       )}
 
-      {/* Items List View */}
-      <section className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-6">
-        {data.items.map((item) => {
+      {/* Filters Section (Displayed whenever the list has items) */}
+      {data.items.length > 0 && (
+        <section className="bg-white rounded-2xl p-5 shadow-sm border border-gray-200 space-y-4">
+          {/* Header with counter and reset */}
+          <div className="flex flex-wrap items-center justify-between gap-3 pb-3 border-b border-gray-100">
+            <div className="flex items-center gap-2.5">
+              <span className="text-base font-bold text-gray-900 flex items-center gap-2">
+                <span>🔍</span>
+                <span>Filtres</span>
+              </span>
+              <span className="text-xs font-semibold px-2.5 py-0.5 rounded-full bg-blue-50 text-blue-700 border border-blue-200">
+                {filteredItems.length} sur {data.items.length} {filteredItems.length <= 1 ? 'article' : 'articles'}
+              </span>
+            </div>
+
+            <div className="flex items-center gap-3">
+              {!data.isAdmin && (
+                <label className="flex items-center gap-1.5 text-xs text-gray-600 font-medium cursor-pointer select-none">
+                  <input
+                    type="checkbox"
+                    checked={hideReserved}
+                    onChange={(e) => setHideReserved(e.target.checked)}
+                    className="rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+                  />
+                  <span>Masquer déjà réservés</span>
+                </label>
+              )}
+
+              {isFiltered && (
+                <button
+                  type="button"
+                  onClick={handleResetFilters}
+                  className="text-xs font-semibold text-red-600 hover:text-red-700 hover:underline flex items-center gap-1 cursor-pointer transition-colors"
+                >
+                  <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                  </svg>
+                  Réinitialiser les filtres
+                </button>
+              )}
+            </div>
+          </div>
+
+          {/* Filter options grid */}
+          <div className="grid grid-cols-1 lg:grid-cols-12 gap-5">
+            {/* 1. Sites Filter (col-span-7) */}
+            <div className="lg:col-span-7 space-y-2">
+              <div className="flex items-center justify-between">
+                <span className="text-xs font-bold uppercase tracking-wider text-gray-600 flex items-center gap-1.5">
+                  <span>🏪</span>
+                  <span>Sites & Boutiques ({availableSites.length})</span>
+                </span>
+                <div className="flex gap-2">
+                  {selectedSites.length > 0 ? (
+                    <button
+                      type="button"
+                      onClick={() => setSelectedSites([])}
+                      className="text-[11px] text-blue-600 hover:underline cursor-pointer font-medium"
+                    >
+                      Afficher tous les sites
+                    </button>
+                  ) : availableSites.length > 1 ? (
+                    <button
+                      type="button"
+                      onClick={handleSelectAllSites}
+                      className="text-[11px] text-gray-500 hover:text-gray-800 hover:underline cursor-pointer"
+                    >
+                      Tout sélectionner
+                    </button>
+                  ) : null}
+                </div>
+              </div>
+
+              {/* Site chips: strictly from items present in the list */}
+              <div className="flex flex-wrap gap-1.5">
+                <button
+                  type="button"
+                  onClick={() => setSelectedSites([])}
+                  className={`text-xs px-3 py-1.5 rounded-xl border transition-all cursor-pointer font-medium ${
+                    selectedSites.length === 0
+                      ? 'bg-gray-900 text-white border-gray-900 shadow-sm font-semibold'
+                      : 'bg-white text-gray-700 border-gray-200 hover:bg-gray-100 hover:border-gray-300'
+                  }`}
+                >
+                  Tous les sites ({data.items.length})
+                </button>
+                {availableSites.map((site) => {
+                  const isSelected = selectedSites.includes(site.name);
+                  return (
+                    <button
+                      key={site.name}
+                      type="button"
+                      onClick={() => handleToggleSite(site.name)}
+                      className={`text-xs px-3 py-1.5 rounded-xl border transition-all cursor-pointer font-medium flex items-center gap-1.5 ${
+                        isSelected
+                          ? 'bg-blue-600 text-white border-blue-600 shadow-sm font-semibold ring-2 ring-blue-100'
+                          : 'bg-white text-gray-700 border-gray-200 hover:bg-gray-100 hover:border-gray-300'
+                      }`}
+                    >
+                      <span>{site.name}</span>
+                      <span
+                        className={`text-[10px] px-1.5 py-0.2 rounded-full font-bold ${
+                          isSelected ? 'bg-blue-800 text-white' : 'bg-gray-100 text-gray-600'
+                        }`}
+                      >
+                        {site.count}
+                      </span>
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+
+            {/* 2. Dynamic Price Filter (col-span-5) */}
+            <div className="lg:col-span-5 space-y-2 border-t lg:border-t-0 lg:border-l lg:pl-5 border-gray-100 pt-3 lg:pt-0">
+              <div className="flex items-center justify-between">
+                <span className="text-xs font-bold uppercase tracking-wider text-gray-600 flex items-center gap-1.5">
+                  <span>💶</span>
+                  <span>Échelle de prix</span>
+                </span>
+                {isPriceFiltered && (
+                  <button
+                    type="button"
+                    onClick={() => setPriceRange(null)}
+                    className="text-[11px] text-blue-600 hover:underline cursor-pointer font-medium"
+                  >
+                    Réinitialiser prix
+                  </button>
+                )}
+              </div>
+
+              {hasPricedItems ? (
+                <div className="space-y-3 pt-1">
+                  {minPriceBound < maxPriceBound ? (
+                    <>
+                      {/* Price values display & direct inputs */}
+                      <div className="flex items-center justify-between text-xs font-semibold text-gray-700">
+                        <div className="flex items-center gap-1 bg-gray-50 border border-gray-200 rounded-lg px-2 py-1 focus-within:ring-1 focus-within:ring-blue-500 focus-within:border-blue-500">
+                          <span className="text-gray-400 text-[11px]">Min :</span>
+                          <input
+                            type="number"
+                            min={minPriceBound}
+                            max={effectiveMax - 1}
+                            value={effectiveMin}
+                            onChange={(e) => {
+                              handleMinPriceChange(Number(e.target.value));
+                            }}
+                            className="w-14 text-center font-bold text-emerald-700 bg-transparent focus:outline-none [appearance:textfield] [&::-webkit-outer-spin-button]:appearance-none [&::-webkit-inner-spin-button]:appearance-none"
+                          />
+                          <span className="text-emerald-700">€</span>
+                        </div>
+                        <span className="text-gray-400 font-normal">à</span>
+                        <div className="flex items-center gap-1 bg-gray-50 border border-gray-200 rounded-lg px-2 py-1 focus-within:ring-1 focus-within:ring-blue-500 focus-within:border-blue-500">
+                          <span className="text-gray-400 text-[11px]">Max :</span>
+                          <input
+                            type="number"
+                            min={effectiveMin + 1}
+                            max={maxPriceBound}
+                            value={effectiveMax}
+                            onChange={(e) => {
+                              handleMaxPriceChange(Number(e.target.value));
+                            }}
+                            className="w-14 text-center font-bold text-emerald-700 bg-transparent focus:outline-none [appearance:textfield] [&::-webkit-outer-spin-button]:appearance-none [&::-webkit-inner-spin-button]:appearance-none"
+                          />
+                          <span className="text-emerald-700">€</span>
+                        </div>
+                      </div>
+
+                      {/* Dual range slider */}
+                      <div className="relative h-6 flex items-center py-2">
+                        <div className="absolute w-full h-2 bg-gray-200 rounded-lg">
+                          <div
+                            className="absolute h-2 bg-blue-600 rounded-lg"
+                            style={{
+                              left: `${((effectiveMin - minPriceBound) / (maxPriceBound - minPriceBound || 1)) * 100}%`,
+                              width: `${((effectiveMax - effectiveMin) / (maxPriceBound - minPriceBound || 1)) * 100}%`,
+                            }}
+                          />
+                        </div>
+                        <input
+                          type="range"
+                          min={minPriceBound}
+                          max={maxPriceBound}
+                          value={effectiveMin}
+                          onChange={(e) => {
+                            handleMinPriceChange(Number(e.target.value));
+                          }}
+                          style={{
+                            zIndex: effectiveMin > (minPriceBound + maxPriceBound) / 2 ? 20 : 10,
+                          }}
+                          className="absolute w-full h-2 appearance-none bg-transparent pointer-events-none [&::-webkit-slider-thumb]:pointer-events-auto [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:w-5 [&::-webkit-slider-thumb]:h-5 [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:bg-blue-600 [&::-webkit-slider-thumb]:border-2 [&::-webkit-slider-thumb]:border-white [&::-webkit-slider-thumb]:shadow-md [&::-webkit-slider-thumb]:cursor-pointer [&::-moz-range-thumb]:pointer-events-auto [&::-moz-range-thumb]:w-5 [&::-moz-range-thumb]:h-5 [&::-moz-range-thumb]:rounded-full [&::-moz-range-thumb]:bg-blue-600 [&::-moz-range-thumb]:border-2 [&::-moz-range-thumb]:border-white [&::-moz-range-thumb]:shadow-md [&::-moz-range-thumb]:cursor-pointer"
+                        />
+                        <input
+                          type="range"
+                          min={minPriceBound}
+                          max={maxPriceBound}
+                          value={effectiveMax}
+                          onChange={(e) => {
+                            handleMaxPriceChange(Number(e.target.value));
+                          }}
+                          style={{
+                            zIndex: effectiveMin > (minPriceBound + maxPriceBound) / 2 ? 10 : 20,
+                          }}
+                          className="absolute w-full h-2 appearance-none bg-transparent pointer-events-none [&::-webkit-slider-thumb]:pointer-events-auto [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:w-5 [&::-webkit-slider-thumb]:h-5 [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:bg-blue-600 [&::-webkit-slider-thumb]:border-2 [&::-webkit-slider-thumb]:border-white [&::-webkit-slider-thumb]:shadow-md [&::-webkit-slider-thumb]:cursor-pointer [&::-moz-range-thumb]:pointer-events-auto [&::-moz-range-thumb]:w-5 [&::-moz-range-thumb]:h-5 [&::-moz-range-thumb]:rounded-full [&::-moz-range-thumb]:bg-blue-600 [&::-moz-range-thumb]:border-2 [&::-moz-range-thumb]:border-white [&::-moz-range-thumb]:shadow-md [&::-moz-range-thumb]:cursor-pointer"
+                        />
+                      </div>
+
+                      <div className="flex items-center justify-between text-[11px] text-gray-400">
+                        <span>Min : {minPriceBound} €</span>
+                        <span>Max : {maxPriceBound} €</span>
+                      </div>
+                    </>
+                  ) : (
+                    <p className="text-xs text-gray-600 italic">
+                      Tous les articles avec prix sont à {minPriceBound} €.
+                    </p>
+                  )}
+
+                  {unpricedCount > 0 && (
+                    <label className="flex items-center gap-2 cursor-pointer text-xs text-gray-600 select-none pt-1">
+                      <input
+                        type="checkbox"
+                        checked={includeNoPrice}
+                        onChange={(e) => setIncludeNoPrice(e.target.checked)}
+                        className="rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+                      />
+                      <span>Inclure articles sans prix ({unpricedCount})</span>
+                    </label>
+                  )}
+                </div>
+              ) : (
+                <p className="text-xs text-gray-500 italic pt-1">Aucun prix renseigné sur les articles.</p>
+              )}
+            </div>
+          </div>
+        </section>
+      )}
+
+      {/* Items List View or Filter Empty State */}
+      {filteredItems.length === 0 ? (
+        <div className="bg-white rounded-2xl p-12 text-center border border-gray-200 shadow-sm space-y-3">
+          <span className="text-4xl block">🔎</span>
+          <h3 className="text-lg font-bold text-gray-800">Aucun article trouvé</h3>
+          <p className="text-sm text-gray-500 max-w-md mx-auto">
+            Aucun article ne correspond aux critères de prix ou de boutique sélectionnés.
+          </p>
+          <button
+            type="button"
+            onClick={handleResetFilters}
+            className="mt-2 inline-flex items-center gap-2 bg-blue-600 hover:bg-blue-700 text-white text-xs font-semibold py-2.5 px-4 rounded-xl shadow-sm transition-colors cursor-pointer"
+          >
+            Réinitialiser les filtres
+          </button>
+        </div>
+      ) : (
+        <section className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-6">
+          {filteredItems.map((item) => {
           const itemImages = parseItemImages(item.image_url);
           const coverImage = itemImages[0] || '';
+          const stats = getItemReservationStats(item.quantity, item.reserved_by, item.is_reserved);
 
           return (
             <div
@@ -824,6 +1358,13 @@ function WishlistContent() {
                       </button>
                     )}
 
+                    {/* Status ribbon for guests */}
+                    {!data.isAdmin && stats.isFullyReserved && (
+                      <span className="absolute top-3 right-3 z-10 bg-red-600/90 text-white text-[11px] font-bold px-2.5 py-0.5 rounded-full shadow-sm tracking-wide uppercase">
+                        Réservé
+                      </span>
+                    )}
+
                     {/* Multiple images indicator */}
                     {itemImages.length > 1 && (
                       <span className="absolute bottom-2 right-2 z-10 bg-black/70 backdrop-blur-sm text-white text-[11px] font-medium px-2 py-0.5 rounded-md flex items-center gap-1 shadow">
@@ -861,21 +1402,56 @@ function WishlistContent() {
                     )}
                   </div>
 
-                  {/* Product Title */}
-                  <div className="p-4 pb-2">
+                  {/* Product Title & Quantity Badge */}
+                  <div className="p-4 pb-2 flex items-start justify-between gap-2">
                     <h3 className="font-bold text-gray-900 line-clamp-2 text-base leading-snug group-hover/btn:text-blue-600 transition-colors">
                       {item.title}
                     </h3>
+                    {stats.totalQty > 1 && (
+                      <span
+                        className={`shrink-0 font-bold text-xs px-2 py-0.5 rounded-md border shadow-xs ${
+                          !data.isAdmin && stats.isFullyReserved
+                            ? 'bg-red-50 text-red-700 border-red-200'
+                            : !data.isAdmin && stats.reservedCount > 0
+                            ? 'bg-amber-50 text-amber-800 border-amber-200'
+                            : 'bg-blue-50 text-blue-700 border-blue-200'
+                        }`}
+                        title={
+                          !data.isAdmin && stats.reservedCount > 0
+                            ? `${stats.reservedCount} pris sur ${stats.totalQty} (${stats.remainingQty} libre)`
+                            : `${stats.totalQty} unités souhaitées`
+                        }
+                      >
+                        {!data.isAdmin ? `${stats.remainingQty}/${stats.totalQty} libre` : `×${stats.totalQty}`}
+                      </span>
+                    )}
                   </div>
                 </button>
 
                 {/* Price and Options / Notes */}
                 <div className="px-4 pb-4">
-                  {item.price !== null && (
-                    <p className="text-xl font-extrabold text-emerald-600">
-                      {item.price.toFixed(2)} €
-                    </p>
-                  )}
+                  <div className="flex items-baseline justify-between gap-2 flex-wrap">
+                    {item.price !== null && (
+                      <div>
+                        <p className="text-xl font-extrabold text-emerald-600">
+                          {item.price.toFixed(2)} €
+                        </p>
+                        {stats.totalQty > 1 && (
+                          <p className="text-[11px] text-gray-500 font-medium">
+                            {(item.price * stats.totalQty).toFixed(2)} € total ({stats.totalQty} unités)
+                          </p>
+                        )}
+                      </div>
+                    )}
+                    {item.price === null && stats.totalQty > 1 && (
+                      <span className="text-xs font-semibold text-blue-700 bg-blue-50 border border-blue-200 px-2 py-0.5 rounded-md">
+                        {stats.totalQty} unités
+                      </span>
+                    )}
+                    <span className="text-[11px] font-medium text-gray-500 bg-gray-100 px-2 py-0.5 rounded-md border border-gray-200">
+                      {extractSiteName(item.product_url)}
+                    </span>
+                  </div>
                   {item.options && (
                     <p className="text-xs text-gray-500 mt-1.5 line-clamp-2">
                       <span className="font-medium text-gray-600">Options:</span> {item.options}
@@ -888,56 +1464,117 @@ function WishlistContent() {
               <div className="p-4 pt-3 border-t border-gray-100 mt-auto bg-gray-50/50">
                 {!data.isAdmin ? (
                   <div>
-                    {item.is_reserved ? (
+                    {stats.isFullyReserved ? (
                       <div className="flex items-center justify-between gap-2 bg-red-50 text-red-700 border border-red-200 py-1.5 px-3 rounded-lg text-xs font-semibold">
-                        <span className="truncate">Réservé par {item.reserved_by}</span>
+                        <span
+                          className="truncate min-w-0 flex-1"
+                          title={formatReserversTooltip(stats.reservations)}
+                        >
+                          Réservé par {formatReserversSummary(stats.reservations)}
+                        </span>
                         <button
                           type="button"
-                          onClick={(e) => handleCancelReservation(item.id, e)}
-                          className="text-xs bg-white hover:bg-red-100 text-red-700 border border-red-200 px-2 py-0.5 rounded shadow-sm transition-colors cursor-pointer shrink-0 font-medium"
+                          onClick={(e) => handleCancelReservation(item.id, e, stats.reservations)}
+                          className="text-xs bg-white hover:bg-red-100 text-red-700 border border-red-200 px-2 py-0.5 rounded shadow-xs transition-colors cursor-pointer shrink-0 font-medium"
                           title="Annuler cette réservation"
                         >
                           Annuler
                         </button>
                       </div>
                     ) : reservingItemId === item.id ? (
-                      <div className="flex gap-1.5">
-                        <input
-                          type="text"
-                          placeholder="Votre nom"
-                          value={reserverName}
-                          onChange={(e) => setReserverName(e.target.value)}
-                          onKeyDown={(e) => e.key === 'Enter' && handleReserve(item.id)}
-                          className="text-xs border border-gray-300 rounded-lg px-2.5 py-1.5 text-black flex-1 focus:outline-none focus:ring-2 focus:ring-blue-500 bg-white"
-                          autoFocus
-                        />
-                        <button
-                          type="button"
-                          onClick={() => handleReserve(item.id)}
-                          className="bg-blue-600 hover:bg-blue-700 text-white text-xs font-semibold px-3 py-1.5 rounded-lg transition-colors shadow-sm cursor-pointer"
-                        >
-                          OK
-                        </button>
+                      <div className="space-y-2 bg-white p-2.5 rounded-lg border border-blue-200 shadow-xs">
+                        {stats.remainingQty > 1 && (
+                          <div className="flex items-center justify-between text-xs text-gray-700 font-medium">
+                            <span>Quantité :</span>
+                            <div className="flex items-center gap-1 border border-gray-200 rounded-md overflow-hidden bg-gray-50">
+                              <button
+                                type="button"
+                                onClick={() => setReserveCount((c) => Math.max(1, c - 1))}
+                                className="px-2 py-0.5 text-gray-700 hover:bg-gray-200 font-bold select-none cursor-pointer"
+                                title="Diminuer"
+                              >
+                                −
+                              </button>
+                              <span className="px-2 text-xs font-bold text-gray-800 select-none">
+                                {reserveCount}
+                              </span>
+                              <button
+                                type="button"
+                                onClick={() => setReserveCount((c) => Math.min(stats.remainingQty, c + 1))}
+                                className="px-2 py-0.5 text-gray-700 hover:bg-gray-200 font-bold select-none cursor-pointer"
+                                title="Augmenter"
+                              >
+                                +
+                              </button>
+                            </div>
+                            <span className="text-[11px] text-emerald-700 font-semibold">
+                              ({stats.remainingQty}/{stats.totalQty} libre)
+                            </span>
+                          </div>
+                        )}
+                        <div className="flex gap-1.5">
+                          <input
+                            type="text"
+                            placeholder="Votre nom"
+                            value={reserverName}
+                            onChange={(e) => setReserverName(e.target.value)}
+                            onKeyDown={(e) => e.key === 'Enter' && handleReserve(item.id, reserveCount)}
+                            className="text-xs border border-gray-300 rounded-lg px-2.5 py-1.5 text-black flex-1 focus:outline-none focus:ring-2 focus:ring-blue-500 bg-white"
+                            autoFocus
+                          />
+                          <button
+                            type="button"
+                            onClick={() => handleReserve(item.id, reserveCount)}
+                            className="bg-blue-600 hover:bg-blue-700 text-white text-xs font-semibold px-3 py-1.5 rounded-lg transition-colors shadow-xs cursor-pointer"
+                          >
+                            OK
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setReservingItemId(null);
+                              setReserverName('');
+                              setReserveCount(1);
+                            }}
+                            className="bg-gray-200 hover:bg-gray-300 text-gray-700 text-xs px-2.5 py-1.5 rounded-lg transition-colors cursor-pointer"
+                            title="Annuler"
+                          >
+                            ✕
+                          </button>
+                        </div>
+                      </div>
+                    ) : (
+                      <div className="space-y-1.5">
+                        {stats.totalQty > 1 && stats.reservedCount > 0 && (
+                          <div className="flex items-center justify-between text-xs px-0.5 text-gray-600">
+                            <span
+                              className="truncate text-[11px] text-gray-500 max-w-[65%]"
+                              title={formatReserversTooltip(stats.reservations)}
+                            >
+                              <strong className="text-amber-700 font-semibold">{stats.reservedCount} pris</strong>{' '}
+                              ({formatReserversSummary(stats.reservations)})
+                            </span>
+                            <span className="text-xs font-bold text-emerald-700 shrink-0">
+                              {stats.remainingQty}/{stats.totalQty} libre
+                            </span>
+                          </div>
+                        )}
                         <button
                           type="button"
                           onClick={() => {
-                            setReservingItemId(null);
-                            setReserverName('');
+                            setReservingItemId(item.id);
+                            setReserveCount(1);
                           }}
-                          className="bg-gray-200 hover:bg-gray-300 text-gray-700 text-xs px-2.5 py-1.5 rounded-lg transition-colors cursor-pointer"
-                          title="Annuler"
+                          className="w-full bg-blue-600 hover:bg-blue-700 text-white text-xs font-semibold py-2 px-3 rounded-lg transition-colors shadow-xs cursor-pointer flex items-center justify-center gap-1.5"
                         >
-                          ✕
+                          <span>Réserver</span>
+                          {stats.totalQty > 1 && (
+                            <span className="bg-blue-700/60 text-white text-[10px] font-bold px-1.5 py-0.5 rounded">
+                              {stats.remainingQty}/{stats.totalQty} libre
+                            </span>
+                          )}
                         </button>
                       </div>
-                    ) : (
-                      <button
-                        type="button"
-                        onClick={() => setReservingItemId(item.id)}
-                        className="w-full bg-blue-600 hover:bg-blue-700 text-white text-xs font-semibold py-2 px-4 rounded-lg transition-colors shadow-sm cursor-pointer"
-                      >
-                        Réserver
-                      </button>
                     )}
                   </div>
                 ) : (
@@ -947,7 +1584,7 @@ function WishlistContent() {
                     rel="noopener noreferrer"
                     className="block text-center text-xs font-medium text-gray-500 hover:text-blue-600 py-1.5 rounded-lg border border-gray-200 hover:bg-white transition-colors"
                   >
-                    Voir sur la boutique ↗
+                    Voir sur {extractSiteName(item.product_url)} ↗
                   </a>
                 )}
               </div>
@@ -955,11 +1592,13 @@ function WishlistContent() {
           );
         })}
       </section>
+      )}
 
       {/* Product Detail Modal */}
       {selectedItem && (() => {
         const modalImages = parseItemImages(selectedItem.image_url);
         const currentImage = modalImages[activeImageIndex] || modalImages[0] || '';
+        const modalStats = getItemReservationStats(selectedItem.quantity, selectedItem.reserved_by, selectedItem.is_reserved);
 
         return (
           <div
@@ -1079,14 +1718,54 @@ function WishlistContent() {
                     {selectedItem.title}
                   </h2>
 
-                  {/* Large Price */}
-                  {selectedItem.price !== null && (
-                    <div className="flex items-baseline gap-2">
-                      <span className="text-3xl font-extrabold text-emerald-600">
-                        {selectedItem.price.toFixed(2)} €
-                      </span>
-                    </div>
-                  )}
+                  {/* Large Price and Quantity */}
+                  <div className="flex items-baseline justify-between gap-4 flex-wrap">
+                    {selectedItem.price !== null ? (
+                      <div>
+                        <div className="flex items-baseline gap-2">
+                          <span className="text-3xl font-extrabold text-emerald-600">
+                            {selectedItem.price.toFixed(2)} €
+                          </span>
+                          {selectedItem.quantity && selectedItem.quantity > 1 && (
+                            <span className="text-xs text-gray-500 font-medium">l&apos;unité</span>
+                          )}
+                        </div>
+                        {selectedItem.quantity && selectedItem.quantity > 1 && (
+                          <p className="text-sm text-gray-600 font-medium mt-1">
+                            Total estimé : <span className="font-bold text-emerald-700">{(selectedItem.price * selectedItem.quantity).toFixed(2)} €</span> pour {selectedItem.quantity} unités
+                          </p>
+                        )}
+                      </div>
+                    ) : (
+                      <span className="text-sm text-gray-400 italic">Prix non renseigné</span>
+                    )}
+
+                    {modalStats.totalQty > 1 && (
+                      <div className="flex flex-col items-end gap-1">
+                        <div className="flex items-center gap-1.5 bg-blue-50 text-blue-700 px-3.5 py-1.5 rounded-xl border border-blue-200 shadow-xs">
+                          <span className="text-xs font-bold uppercase tracking-wider">Quantité souhaitée :</span>
+                          <span className="text-lg font-black">{modalStats.totalQty}</span>
+                        </div>
+                        {!data.isAdmin && (
+                          <span
+                            className={`text-xs font-semibold px-2.5 py-0.5 rounded-md border ${
+                              modalStats.isFullyReserved
+                                ? 'bg-red-50 text-red-700 border-red-200'
+                                : modalStats.reservedCount > 0
+                                ? 'bg-amber-50 text-amber-800 border-amber-200'
+                                : 'bg-blue-50 text-blue-700 border-blue-200'
+                            }`}
+                          >
+                            {modalStats.isFullyReserved
+                              ? 'Tous réservés'
+                              : modalStats.reservedCount > 0
+                              ? `${modalStats.reservedCount} pris • ${modalStats.remainingQty}/${modalStats.totalQty} libre`
+                              : `${modalStats.totalQty}/${modalStats.totalQty} libre`}
+                          </span>
+                        )}
+                      </div>
+                    )}
+                  </div>
 
                   {/* Notes / Options */}
                   {selectedItem.options && (
@@ -1110,7 +1789,7 @@ function WishlistContent() {
                   rel="noopener noreferrer"
                   className="w-full sm:w-auto flex-1 bg-white hover:bg-gray-100 text-gray-800 text-sm font-semibold py-3 px-4 rounded-xl border border-gray-300 text-center transition-colors flex items-center justify-center gap-2 shadow-sm"
                 >
-                  <span>Voir sur la boutique</span>
+                  <span>Voir sur {extractSiteName(selectedItem.product_url)}</span>
                   <svg className="w-4 h-4 text-gray-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" />
                   </svg>
@@ -1118,56 +1797,115 @@ function WishlistContent() {
 
                 {!data.isAdmin && (
                   <div className="w-full sm:w-auto flex-1">
-                    {selectedItem.is_reserved ? (
-                      <div className="flex items-center justify-between gap-3 bg-red-50 border border-red-200 py-2.5 px-4 rounded-xl">
-                        <span className="text-sm font-semibold text-red-700 truncate">
-                          Réservé par {selectedItem.reserved_by}
+                    {modalStats.isFullyReserved ? (
+                      <div className="flex items-center justify-between gap-3 bg-red-50 border border-red-200 py-2.5 px-4 rounded-xl min-w-0">
+                        <span
+                          className="text-sm font-semibold text-red-700 truncate min-w-0 flex-1"
+                          title={formatReserversTooltip(modalStats.reservations)}
+                        >
+                          Réservé par {formatReserversSummary(modalStats.reservations)}
                         </span>
                         <button
                           type="button"
-                          onClick={() => handleCancelReservation(selectedItem.id)}
-                          className="bg-white hover:bg-red-100 text-red-700 border border-red-300 text-xs font-semibold px-3 py-1.5 rounded-lg transition-colors shadow-sm cursor-pointer shrink-0"
+                          onClick={() => handleCancelReservation(selectedItem.id, undefined, modalStats.reservations)}
+                          className="bg-white hover:bg-red-100 text-red-700 border border-red-300 text-xs font-semibold px-3 py-1.5 rounded-lg transition-colors shadow-xs cursor-pointer shrink-0"
                         >
-                          Annuler la réservation
+                          Annuler
                         </button>
                       </div>
                     ) : reservingItemId === selectedItem.id ? (
-                      <div className="flex gap-2">
-                        <input
-                          type="text"
-                          placeholder="Votre nom"
-                          value={reserverName}
-                          onChange={(e) => setReserverName(e.target.value)}
-                          onKeyDown={(e) => e.key === 'Enter' && handleReserve(selectedItem.id)}
-                          className="text-sm border border-gray-300 rounded-xl px-3 py-2 text-black flex-1 focus:outline-none focus:ring-2 focus:ring-blue-500 bg-white"
-                          autoFocus
-                        />
-                        <button
-                          type="button"
-                          onClick={() => handleReserve(selectedItem.id)}
-                          className="bg-blue-600 hover:bg-blue-700 text-white text-sm font-semibold px-4 py-2 rounded-xl transition-colors shadow-sm"
-                        >
-                          OK
-                        </button>
+                      <div className="bg-white p-3 rounded-xl border border-blue-200 shadow-xs space-y-2.5 w-full">
+                        {modalStats.remainingQty > 1 && (
+                          <div className="flex items-center justify-between text-xs text-gray-700 font-medium">
+                            <span>Quantité à réserver :</span>
+                            <div className="flex items-center gap-1.5 border border-gray-200 rounded-lg overflow-hidden bg-gray-50">
+                              <button
+                                type="button"
+                                onClick={() => setReserveCount((c) => Math.max(1, c - 1))}
+                                className="px-2.5 py-1 text-gray-700 hover:bg-gray-200 font-bold select-none cursor-pointer"
+                                title="Diminuer"
+                              >
+                                −
+                              </button>
+                              <span className="px-2 text-sm font-bold text-gray-900 select-none">
+                                {reserveCount}
+                              </span>
+                              <button
+                                type="button"
+                                onClick={() => setReserveCount((c) => Math.min(modalStats.remainingQty, c + 1))}
+                                className="px-2.5 py-1 text-gray-700 hover:bg-gray-200 font-bold select-none cursor-pointer"
+                                title="Augmenter"
+                              >
+                                +
+                              </button>
+                            </div>
+                            <span className="text-xs text-emerald-700 font-bold">
+                              ({modalStats.remainingQty}/{modalStats.totalQty} libre)
+                            </span>
+                          </div>
+                        )}
+                        <div className="flex gap-2">
+                          <input
+                            type="text"
+                            placeholder="Votre nom"
+                            value={reserverName}
+                            onChange={(e) => setReserverName(e.target.value)}
+                            onKeyDown={(e) => e.key === 'Enter' && handleReserve(selectedItem.id, reserveCount)}
+                            className="text-sm border border-gray-300 rounded-xl px-3 py-2 text-black flex-1 focus:outline-none focus:ring-2 focus:ring-blue-500 bg-white"
+                            autoFocus
+                          />
+                          <button
+                            type="button"
+                            onClick={() => handleReserve(selectedItem.id, reserveCount)}
+                            className="bg-blue-600 hover:bg-blue-700 text-white text-sm font-semibold px-4 py-2 rounded-xl transition-colors shadow-xs cursor-pointer"
+                          >
+                            OK
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setReservingItemId(null);
+                              setReserverName('');
+                              setReserveCount(1);
+                            }}
+                            className="bg-gray-200 hover:bg-gray-300 text-gray-700 text-sm px-3 py-2 rounded-xl transition-colors cursor-pointer"
+                          >
+                            ✕
+                          </button>
+                        </div>
+                      </div>
+                    ) : (
+                      <div className="flex flex-col gap-1.5 w-full">
+                        {modalStats.totalQty > 1 && modalStats.reservedCount > 0 && (
+                          <div className="flex items-center justify-between text-xs px-1 text-gray-600">
+                            <span
+                              className="truncate text-xs text-gray-500 max-w-[65%]"
+                              title={formatReserversTooltip(modalStats.reservations)}
+                            >
+                              <strong className="text-amber-700 font-semibold">{modalStats.reservedCount} pris</strong>{' '}
+                              ({formatReserversSummary(modalStats.reservations)})
+                            </span>
+                            <span className="text-xs font-bold text-emerald-700">
+                              {modalStats.remainingQty}/{modalStats.totalQty} libre
+                            </span>
+                          </div>
+                        )}
                         <button
                           type="button"
                           onClick={() => {
-                            setReservingItemId(null);
-                            setReserverName('');
+                            setReservingItemId(selectedItem.id);
+                            setReserveCount(1);
                           }}
-                          className="bg-gray-200 hover:bg-gray-300 text-gray-700 text-sm px-3 py-2 rounded-xl transition-colors"
+                          className="w-full bg-blue-600 hover:bg-blue-700 text-white text-sm font-semibold py-3 px-5 rounded-xl transition-colors shadow-xs flex items-center justify-center gap-2 cursor-pointer"
                         >
-                          ✕
+                          <span>Réserver ce cadeau</span>
+                          {modalStats.totalQty > 1 && (
+                            <span className="bg-blue-700/60 text-white text-xs font-bold px-2 py-0.5 rounded-md">
+                              {modalStats.remainingQty}/{modalStats.totalQty} libre
+                            </span>
+                          )}
                         </button>
                       </div>
-                    ) : (
-                      <button
-                        type="button"
-                        onClick={() => setReservingItemId(selectedItem.id)}
-                        className="w-full bg-blue-600 hover:bg-blue-700 text-white text-sm font-semibold py-3 px-4 rounded-xl transition-colors shadow-sm"
-                      >
-                        Réserver ce cadeau
-                      </button>
                     )}
                   </div>
                 )}
@@ -1220,7 +1958,7 @@ function WishlistContent() {
                 />
               </div>
 
-              <div className="grid grid-cols-2 gap-3">
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
                 <div>
                   <label className="block text-sm font-medium text-gray-700 mb-1">Prix (€)</label>
                   <input
@@ -1230,6 +1968,38 @@ function WishlistContent() {
                     onChange={(e) => setEditPrice(e.target.value)}
                     className="w-full border rounded-xl px-3 py-2 text-black focus:outline-none focus:ring-2 focus:ring-blue-500"
                   />
+                </div>
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-1">Quantité</label>
+                  <div className="flex items-center border border-gray-300 rounded-xl overflow-hidden bg-white focus-within:ring-2 focus-within:ring-blue-500">
+                    <button
+                      type="button"
+                      onClick={() => setEditQuantity((q) => Math.max(1, q - 1))}
+                      className="px-3 py-2 bg-gray-50 hover:bg-gray-100 text-gray-700 font-bold border-r border-gray-200 cursor-pointer select-none"
+                      title="Diminuer la quantité"
+                    >
+                      −
+                    </button>
+                    <input
+                      type="number"
+                      min={1}
+                      max={999}
+                      value={editQuantity}
+                      onChange={(e) => {
+                        const val = parseInt(e.target.value, 10);
+                        setEditQuantity(isNaN(val) || val < 1 ? 1 : val);
+                      }}
+                      className="w-full text-center py-2 text-black font-semibold focus:outline-none [appearance:textfield] [&::-webkit-outer-spin-button]:appearance-none [&::-webkit-inner-spin-button]:appearance-none"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => setEditQuantity((q) => q + 1)}
+                      className="px-3 py-2 bg-gray-50 hover:bg-gray-100 text-gray-700 font-bold border-l border-gray-200 cursor-pointer select-none"
+                      title="Augmenter la quantité"
+                    >
+                      +
+                    </button>
+                  </div>
                 </div>
                 <div>
                   <label className="block text-sm font-medium text-gray-700 mb-1">Rang préférence</label>

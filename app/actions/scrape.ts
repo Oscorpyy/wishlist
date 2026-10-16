@@ -30,10 +30,12 @@ function decodeHtmlEntities(text: string): string {
     '&copy;': '©',
     '&reg;': '®',
     '&trade;': '™',
+    '&ndash;': '–',
+    '&mdash;': '—',
   };
 
   return text
-    .replace(/&(?:amp|lt|gt|quot|apos|nbsp|euro|pound|yen|copy|reg|trade|#39);/gi, (match) => namedEntities[match.toLowerCase()] ?? match)
+    .replace(/&(?:amp|lt|gt|quot|apos|nbsp|euro|pound|yen|copy|reg|trade|ndash|mdash|#39);/gi, (match) => namedEntities[match.toLowerCase()] ?? match)
     .replace(/&#(\d+);/g, (_, dec) => {
       try {
         return String.fromCodePoint(parseInt(dec, 10));
@@ -97,32 +99,33 @@ function cleanTitle(title: string): string {
   let cleaned = decodeHtmlEntities(title);
 
   const suffixes = [
-    /\s*[-|:]\s*Amazon(?:\.[a-z]{2,3})?(?::.*)?$/i,
-    /\s*[-|:]\s*RHINOSHIELD(?:\s+France)?$/i,
-    /\s*[-|:]\s*Maxesport(?:\s+France)?$/i,
-    /\s*[-|:]\s*Displate(?:\.com)?$/i,
-    /\s*[-|:]\s*Fnac(?:\.com)?$/i,
-    /\s*[-|:]\s*Darty(?:\.com)?$/i,
-    /\s*[-|:]\s*Boulanger(?:\.com)?$/i,
-    /\s*[-|:]\s*Cdiscount(?:\.com)?$/i,
-    /\s*[-|:]\s*Boutique(?:\s+officielle)?\s+LEGO[®\s]*(?:FR|US|DE)?$/i,
-    /\s*[-|:]\s*LEGO(?:\.[a-z]{2,3})?$/i,
-    /\s*[-|:]\s*Decathlon(?:\.[a-z]{2,3})?$/i,
-    /\s*[-|:]\s*LDLC(?:\.[a-z]{2,3})?$/i,
-    /\s*[-|:]\s*AliExpress$/i,
-    /\s*[-|:]\s*Etsy(?:\s+France)?$/i,
-    /\s*[-|:]\s*Zalando(?:\.[a-z]{2,3})?$/i,
-    /\s*[-|:]\s*Apple(?:\s+\(FR\))?$/i,
-    /\s*[-|:]\s*Nike(?:\.com)?$/i,
-    /\s*[-|:]\s*Adidas(?:\.com)?$/i,
-    /\s*[-|:]\s*Sephora(?:\.fr|\.com)?$/i,
-    /\s*[-|:]\s*Zara$/i,
-    /\s*[-|:]\s*Uniqlo$/i,
-    /\s*[-|:]\s*ASOS$/i,
-    /\s*[-|:]\s*Back\s*Market$/i,
-    /\s*[-|:]\s*eBay(?:\.[a-z]{2,3})?$/i,
-    /\s*[-|:]\s*TopAchat$/i,
-    /\s*[-|:]\s*Materiel\.net$/i,
+    /\s*[-|–|—|:]\s*Amazon(?:\.[a-z]{2,3})?(?::.*)?$/i,
+    /\s*[-|–|—|:]\s*Streetzen(?:\.co)?$/i,
+    /\s*[-|–|—|:]\s*RHINOSHIELD(?:\s+France)?$/i,
+    /\s*[-|–|—|:]\s*Maxesport(?:\s+France)?$/i,
+    /\s*[-|–|—|:]\s*Displate(?:\.com)?$/i,
+    /\s*[-|–|—|:]\s*Fnac(?:\.com)?$/i,
+    /\s*[-|–|—|:]\s*Darty(?:\.com)?$/i,
+    /\s*[-|–|—|:]\s*Boulanger(?:\.com)?$/i,
+    /\s*[-|–|—|:]\s*Cdiscount(?:\.com)?$/i,
+    /\s*[-|–|—|:]\s*Boutique(?:\s+officielle)?\s+LEGO[®\s]*(?:FR|US|DE)?$/i,
+    /\s*[-|–|—|:]\s*LEGO(?:\.[a-z]{2,3})?$/i,
+    /\s*[-|–|—|:]\s*Decathlon(?:\.[a-z]{2,3})?$/i,
+    /\s*[-|–|—|:]\s*LDLC(?:\.[a-z]{2,3})?$/i,
+    /\s*[-|–|—|:]\s*AliExpress$/i,
+    /\s*[-|–|—|:]\s*Etsy(?:\s+France)?$/i,
+    /\s*[-|–|—|:]\s*Zalando(?:\.[a-z]{2,3})?$/i,
+    /\s*[-|–|—|:]\s*Apple(?:\s+\(FR\))?$/i,
+    /\s*[-|–|—|:]\s*Nike(?:\.com)?$/i,
+    /\s*[-|–|—|:]\s*Adidas(?:\.com)?$/i,
+    /\s*[-|–|—|:]\s*Sephora(?:\.fr|\.com)?$/i,
+    /\s*[-|–|—|:]\s*Zara$/i,
+    /\s*[-|–|—|:]\s*Uniqlo$/i,
+    /\s*[-|–|—|:]\s*ASOS$/i,
+    /\s*[-|–|—|:]\s*Back\s*Market$/i,
+    /\s*[-|–|—|:]\s*eBay(?:\.[a-z]{2,3})?$/i,
+    /\s*[-|–|—|:]\s*TopAchat$/i,
+    /\s*[-|–|—|:]\s*Materiel\.net$/i,
   ];
 
   for (const s of suffixes) {
@@ -130,6 +133,7 @@ function cleanTitle(title: string): string {
   }
 
   cleaned = cleaned.replace(/^Amazon(?:\.[a-z]{2,3})?\s*:\s*/i, '');
+  cleaned = cleaned.replace(/^Streetzen(?:\.co)?\s*[-|–|—|:]\s*/i, '');
   cleaned = cleaned.replace(/^RHINOSHIELD(?:\s+France)?\s*[-|:]\s*/i, '');
   cleaned = cleaned.replace(/^Displate\s*[-|:]\s*/i, '');
 
@@ -226,11 +230,16 @@ function normalizeImageUrl(rawUrl: string | undefined | null, baseUrl: string): 
     return null;
   }
 
+  // Upgrade http:// to https://
+  if (trimmed.startsWith('http://')) {
+    trimmed = trimmed.replace(/^http:\/\//i, 'https://');
+  }
+
   // Remove Amazon dynamic downscaling (e.g. ._AC_US40_.jpg -> .jpg)
   trimmed = trimmed.replace(/\._[A-Z0-9,_]+_\.(jpg|png|webp)$/i, '.$1');
 
   // Remove Shopify thumbnail downscaling (e.g. _100x100.jpg -> .jpg)
-  trimmed = trimmed.replace(/_(?:small|thumb|compact|medium|100x100|150x150|200x200|300x300)\.(jpg|png|webp)/i, '.$1');
+  trimmed = trimmed.replace(/_(?:pico|icon|thumb|small|compact|medium|large|grande|100x100|150x150|200x200|300x300|400x400|600x600)\.(jpg|png|webp)/i, '.$1');
 
   return trimmed;
 }
@@ -410,13 +419,15 @@ async function scrapeDisplate(url: string): Promise<ScrapedProduct | null> {
 async function scrapeShopify(url: string): Promise<ScrapedProduct | null> {
   try {
     const parsedUrl = new URL(url);
-    const productPathMatch = parsedUrl.pathname.match(/(.*\/products\/[a-zA-Z0-9_-]+)/);
+    const cleanPath = parsedUrl.pathname.replace(/\/+$/, '');
+    const productPathMatch = cleanPath.match(/(.*\/products\/[a-zA-Z0-9_-]+)/);
     if (!productPathMatch) return null;
 
+    const slug = cleanPath.split('/').filter(Boolean).pop();
     const candidateUrls = [
       `${parsedUrl.origin}${productPathMatch[1]}.json`,
-      `${parsedUrl.origin}/products/${parsedUrl.pathname.split('/').pop()}.json`,
-    ];
+      slug ? `${parsedUrl.origin}/products/${slug}.json` : null,
+    ].filter(Boolean) as string[];
 
     interface ShopifyVariant {
       id?: string | number;
@@ -425,6 +436,8 @@ async function scrapeShopify(url: string): Promise<ScrapedProduct | null> {
       option1?: string;
       option2?: string;
       option3?: string;
+      featured_image?: { src?: string } | null;
+      image_id?: number | string | null;
     }
     interface ShopifyOption {
       name?: string;
@@ -488,6 +501,28 @@ async function scrapeShopify(url: string): Promise<ScrapedProduct | null> {
       price = parsePrice(selectedVariant.price);
     }
 
+    // Elevate variant-specific image if present
+    if (selectedVariant?.featured_image?.src) {
+      const varImg = normalizeImageUrl(selectedVariant.featured_image.src, url);
+      if (varImg) {
+        const idx = images.indexOf(varImg);
+        if (idx > -1) images.splice(idx, 1);
+        images.unshift(varImg);
+      }
+    } else if (selectedVariant?.image_id && Array.isArray(p.images)) {
+      const matchImg = p.images.find(
+        (img) => typeof img === 'object' && img !== null && 'id' in img && String(img.id) === String(selectedVariant?.image_id)
+      ) as { src?: string } | undefined;
+      if (matchImg?.src) {
+        const varImg = normalizeImageUrl(matchImg.src, url);
+        if (varImg) {
+          const idx = images.indexOf(varImg);
+          if (idx > -1) images.splice(idx, 1);
+          images.unshift(varImg);
+        }
+      }
+    }
+
     const availableOptions: Record<string, string[]> = {};
     const selectedOptionsList: string[] = [];
 
@@ -542,8 +577,44 @@ async function scrapeShopify(url: string): Promise<ScrapedProduct | null> {
 }
 
 /**
+ * Dedicated Streetzen extractor (https://streetzen.co).
+ * Handles direct product URLs, collection-nested product links, and resolves canonical URLs.
+ */
+async function scrapeStreetzen(url: string): Promise<ScrapedProduct | null> {
+  try {
+    // 1. If path contains /products/, scrapeShopify handles it immediately
+    if (url.includes('/products/')) {
+      const shopifyResult = await scrapeShopify(url);
+      if (shopifyResult) return shopifyResult;
+    }
+
+    // 2. Fetch HTML to detect canonical product URL if URL is rewritten/shortened
+    const res = await fetch(url, {
+      headers: {
+        'User-Agent':
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+        Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7',
+      },
+    });
+    if (!res.ok) return null;
+    const html = await res.text();
+    const $ = cheerio.load(html);
+
+    const canonicalHref = $('link[rel="canonical"]').attr('href');
+    if (canonicalHref && canonicalHref.includes('/products/')) {
+      const canonicalResult = await scrapeShopify(canonicalHref);
+      if (canonicalResult) return canonicalResult;
+    }
+  } catch {
+    // fallback
+  }
+  return null;
+}
+
+/**
  * Universal multi-platform product URL scraper.
- * Supports Amazon, Lego, Shopify stores (Maxesport, etc.), Rhinoshield, Fnac, Darty,
+ * Supports Amazon, Lego, Streetzen, Shopify stores (Maxesport, etc.), Rhinoshield, Fnac, Darty,
  * Boulanger, Cdiscount, Sephora, Zara, Nike, Decathlon, and all Schema.org/OpenGraph stores.
  */
 export async function scrapeProductUrl(rawUrl: string): Promise<ScrapedProduct> {
@@ -576,13 +647,19 @@ export async function scrapeProductUrl(rawUrl: string): Promise<ScrapedProduct> 
       if (displateResult) return displateResult;
     }
 
-    // 3. Specialized Adapter: Shopify Stores (Maxesport, apparel, gaming brands)
+    // 3. Specialized Adapter: Streetzen
+    if (url.includes('streetzen.co')) {
+      const streetzenResult = await scrapeStreetzen(url);
+      if (streetzenResult) return streetzenResult;
+    }
+
+    // 4. Specialized Adapter: Shopify Stores (Maxesport, apparel, gaming brands)
     if (url.includes('/products/') || url.includes('/produits/')) {
       const shopifyResult = await scrapeShopify(url);
       if (shopifyResult) return shopifyResult;
     }
 
-    // 4. Amazon ASIN Check
+    // 5. Amazon ASIN Check
     const amazonMatch = url.match(/(?:dp|gp\/product|\/p)\/([A-Z0-9]{10})/i);
     const amazonAsin = amazonMatch ? amazonMatch[1] : null;
 
